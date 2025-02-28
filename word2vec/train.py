@@ -45,6 +45,12 @@ class BookDataset(object):
             f"Normalization前: 総書籍数={len(original_titles)}, ユニークタイトル数={original_unique_count}"
         )
         patterns = [
+            # 上下巻に関わる全ての処理
+            (r"^(?:【.*?】)\s*(.*?)(?:~.*)?$", r"\1"),
+            # パターン：末尾にある、括弧（または類似記号）で囲まれた「第」(任意)＋数字または[上下]+＋(巻)があれば削除
+            (r"[\(〈<]?(?:第)?\s*(?:\d+|[上下]+)(?:巻)?[\)〉>].*$", ""),
+            (r"^(.*?)\s*[\(〈<]?\s*[上下]\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
+            (r"^(.*?)\s*(?:[\(]?(?:第)?\d+巻[\)]?).*$", r"\1"),
             # パターン0: 上巻/下巻の場合：タイトルと、上巻または下巻（括弧や山括弧の有無は問わない）およびその後の余分な情報を除去
             (r"^(.*?)\s*[\(〈<]?\s*(上巻|下巻)\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
             # パターン① 数字の場合：
@@ -52,8 +58,6 @@ class BookDataset(object):
             (r"^(.*?)\s*[\(〈<]?\s*\d+\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
             # パターン② 上下の場合：
             # タイトルと、上または下（括弧・山括弧の有無は問わない）、およびその後の余分な情報を除去
-            (r"^(.*?)\s*[\(〈<]?\s*[上下]\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
-            (r"^(.*?)\s*(?:[\(]?(?:第)?\d+巻[\)]?).*$", r"\1"),
         ]
         for user, books in self.data_gen.items():
             for book in books:
@@ -62,7 +66,7 @@ class BookDataset(object):
                     title = self._convert_brackets(title)
                     norm_title = re.sub(pattern, replace, title, flags=re.IGNORECASE)
                     if norm_title != title:
-                        book["Title"] = norm_title
+                        book["Title"] = self._remove_bunko_prefix(norm_title.strip())
                         break
         # 処理後のユニークなタイトル数をカウント
         normalized_titles = []
@@ -74,6 +78,12 @@ class BookDataset(object):
             f"Normalization後: 総書籍数={len(normalized_titles)}, ユニークタイトル数={normalized_unique_count}"
         )
         print("====")
+
+    def _remove_bunko_prefix(self, title: str) -> str:
+        """
+        タイトルの先頭にある「文庫」とその後の空白を除去する。
+        """
+        return re.sub(r"^文庫\s*", "", title)
 
     def _convert_brackets(self, text: str):
         norm_text = (
