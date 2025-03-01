@@ -10,8 +10,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa
 import torch.optim as optim
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
 # 文脈-user_id , 単語 - 本のタイトル(著者)
@@ -44,27 +42,30 @@ class BookDataset(object):
         print(
             f"Normalization前: 総書籍数={len(original_titles)}, ユニークタイトル数={original_unique_count}"
         )
+        number_pattern = r"(?:\d+|[零一二三四五六七八九十百千万億兆]+)"
         patterns = [
-            # 上下巻に関わる全ての処理
-            (r"^(?:【.*?】)\s*(.*?)(?:~.*)?$", r"\1"),
-            # パターン：末尾にある、括弧（または類似記号）で囲まれた「第」(任意)＋数字または[上下]+＋(巻)があれば削除
-            (r"[\(〈<]?(?:第)?\s*(?:\d+|[上下]+)(?:巻)?[\)〉>].*$", ""),
+            # 新規パターン: タイトルが【...】で始まり、「~」がある場合、最初の「~」以降を除去する
+            (r"^(?:【.*?】)\s*(.+?~.+?~).*$", r"\1"),
+            # 新規パターン: タイトル末尾に空白＋数字＋括弧内の不要情報がある場合、先頭部分のみ抽出
+            (r"^(.*?)\s+\d+\s*\(.*\)$", r"\1"),
+            # 以下、既存のパターン群
+            # 末尾にある、括弧（または類似記号）で囲まれた「第」(任意)＋数字または[上下]+＋(巻)があれば削除
+            (r"[\(〈<]?(?:第)?\s*(?:" + number_pattern + r"|[上下]+)(?:巻)?[\)〉>].*$", ""),
             (r"^(.*?)\s*[\(〈<]?\s*[上下]\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
             (r"^(.*?)\s*(?:[\(]?(?:第)?\d+巻[\)]?).*$", r"\1"),
             # パターン0: 上巻/下巻の場合：タイトルと、上巻または下巻（括弧や山括弧の有無は問わない）およびその後の余分な情報を除去
-            (r"^(.*?)\s*[\(〈<]?\s*(上巻|下巻)\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
-            # パターン① 数字の場合：
-            # タイトルと、数字部分（括弧・山括弧の有無は問わない）、およびその後の余分な情報を除去
+            # パターン① 数字の場合：タイトルと、数字部分（括弧・山括弧の有無は問わない）、およびその後の余分な情報を除去
             (r"^(.*?)\s*[\(〈<]?\s*\d+\s*[\)〉>]?(?:\s+.*)?$", r"\1"),
-            # パターン② 上下の場合：
-            # タイトルと、上または下（括弧・山括弧の有無は問わない）、およびその後の余分な情報を除去
         ]
         for user, books in self.data_gen.items():
             for book in books:
+                title = book.get("Title", "")
+                title = self._remove_sub_title(self._convert_brackets(title))
+                book["Title"] = title
                 for pattern, replace in patterns:
-                    title = book.get("Title", "")
-                    title = self._convert_brackets(title)
-                    norm_title = re.sub(pattern, replace, title, flags=re.IGNORECASE)
+                    norm_title = self._remove_sub_title(
+                        re.sub(pattern, replace, title, flags=re.IGNORECASE)
+                    )
                     if norm_title != title:
                         book["Title"] = self._remove_bunko_prefix(norm_title.strip())
                         break
@@ -84,6 +85,9 @@ class BookDataset(object):
         タイトルの先頭にある「文庫」とその後の空白を除去する。
         """
         return re.sub(r"^文庫\s*", "", title)
+
+    def _remove_sub_title(self, title: str) -> str:
+        return re.sub(r"^(.*?~.*?~).*$", r"\1", title)
 
     def _convert_brackets(self, text: str):
         norm_text = (
@@ -304,79 +308,6 @@ class Trainer(UserBook2Vec):
 
         print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
         self._save_wight_vec()
-
-    def find_gender_axis(
-        self,
-        k: int = 10,  # 全体で使用するペア数（seed ペア含む）
-        n_neighbors: int = 10,  # 各書籍について取得する近傍数（自身を含むので実質10近傍）
-        male_book: str = "人間の建設 (新潮文庫)",
-        female_book: str = "生理用品の社会史: タブーから一大ビジネスへ",
-    ):
-        # 1. seed ペアの取得
-        male_fav_bookid = self.book2id[male_book]
-        female_fav_bookid = self.book2id[female_book]
-        # seed ペアは (male, female) の順に固定
-        seed_pair = (male_fav_bookid, female_fav_bookid)
-        seed_diff = self._compute_diff_vec(seed_pair).reshape(1, -1)
-
-        # 2. 各書籍について、近傍 (10近傍) を取得して候補ペアリストを作成
-
-        nbrs = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine").fit(self.book_embeddings)
-        distances, indices = nbrs.kneighbors(self.book_embeddings)
-
-        candidate_pairs = []
-        N = len(self.book_embeddings)
-        # 各書籍 i について、自身（最初の要素）を除く近傍を候補として (i, neighbor) ペアを追加
-        for i in range(N):
-            for neighbor in indices[i, 1:]:
-                candidate_pairs.append((i, int(neighbor)))
-        candidate_pairs = np.array(candidate_pairs)  # shape: (num_candidates, 2)
-
-        # 3. seed ペアを候補から除外（seed ペアは後で必ず先頭に追加）
-        mask = ~(
-            (candidate_pairs[:, 0] == male_fav_bookid)
-            & (candidate_pairs[:, 1] == female_fav_bookid)
-        )
-        candidate_pairs = candidate_pairs[mask]
-
-        # 4. 各候補ペアの差分ベクトルを一括計算し、seed 差分との cosine 類似度を算出
-        diff_vectors = (
-            self.book_embeddings[candidate_pairs[:, 0]]
-            - self.book_embeddings[candidate_pairs[:, 1]]
-        )
-        sims = cosine_similarity(seed_diff, diff_vectors)[0]  # shape: (num_candidates,)
-
-        # 5. 候補ペアを (pair, sim) のタプルとしてまとめ、類似度降順にソート
-        candidate_list = [(tuple(pair), sim_val) for pair, sim_val in zip(candidate_pairs, sims)]
-        candidate_list.sort(key=lambda x: x[1], reverse=True)
-
-        # 6. グリーディにペアを選択（seed ペアのコミュニティを含むものは除外）
-        selected_pairs = [(seed_pair, 1.0)]  # seed ペアの類似度は 1.0 とする
-        selected_set = set(seed_pair)
-        for pair, sim_val in candidate_list:
-            # 既に選ばれたコミュニティに含まれていなければ選択
-            if (pair[0] not in selected_set) and (pair[1] not in selected_set):
-                selected_pairs.append((pair, sim_val))
-                selected_set.update(pair)
-            if len(selected_pairs) >= k:
-                break
-
-        # 7. 結果表示（各ペアと cosine 類似度）
-        for pair, sim_val in selected_pairs:
-            title1 = self.id2book.get(pair[0], "Unknown")
-            title2 = self.id2book.get(pair[1], "Unknown")
-            print(f"({title1}, {title2}): sim={sim_val:.4f}")
-
-        # 8. 選択された各ペアの差分ベクトルを計算し平均して社会軸を求める
-        selected_diff_vectors = np.array(
-            [self._compute_diff_vec(pair) for pair, _ in selected_pairs]
-        )
-        social_dimension = selected_diff_vectors.mean(axis=0)
-        return social_dimension
-
-    def _compute_diff_vec(self, pair):
-        s1, s2 = pair
-        return self.book_embeddings[s1] - self.book_embeddings[s2]
 
     def _save_wight_vec(self):
         torch.save(self.state_dict(), self.weight_path)
