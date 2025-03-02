@@ -4,6 +4,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import seaborn as sns
 from sklearn.decomposition import PCA
 from sklearn.metrics.pairwise import cosine_similarity
@@ -155,3 +156,6 @@ class Project_On(Trainer):
     def _compute_diff_vec(self, pair):
         s1, s2 = pair
         return self.book_embeddings[s1] - self.book_embeddings[s2]
+
+    def _read_projection_result(self, result_path: Path):
+        return pd.read_csv(result_path)
