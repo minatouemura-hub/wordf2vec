@@ -32,7 +32,7 @@ class ClusterAnalysis(Project_On):
 
     # 1.K-Meansによるクラスタリングとt-SNEによるサンプリングデータの可視化
     def k_means_tsne_plt(self):
-        kmeans = KMeans(n_clusters=self.num_cluster)
+        kmeans = KMeans(n_clusters=self.num_cluster, n_init="auto")
         cluster_label = kmeans.fit_predict(self.book_embeddings)
 
         # sampling
