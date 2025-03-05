@@ -56,7 +56,6 @@ class Project_On(Trainer):
             # for i in tqdm(range(1, 100, 1), desc="Projecting embeddings"):
             projections[i] = np.dot(self.book_embeddings[i], normed_social_axis)
         self._save_projections(projections)
-        return projections
 
     def _save_projections(self, projections):
         RESULT_PATH = self.base_dir / "result" / "projection_result.csv"

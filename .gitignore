@@ -1,4 +1,5 @@
 data/
 test.py
 result/
-weight_vec
+weight_vec/
+plt/

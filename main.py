@@ -22,7 +22,10 @@ def main():
         num_cluster=20,
         num_samples=20000,
     )
+
     clster_analysis.k_means_tsne_plt()
+    clster_analysis.cluster_distribution()
+    clster_analysis.make_correlogram_from_dict()
 
 
 if __name__ == "__main__":
