@@ -3,6 +3,8 @@ import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
+import gc
+
 import dtwmodule  # noqa
 import japanize_matplotlib  # noqa
 import matplotlib.colors as mcolors  # noqa
@@ -287,8 +289,8 @@ class ClusterAnalysis(Project_On):
                 user_series[user] = series
 
         users = list(user_series.keys())
-        # n_users = len(users)
-        n_users = 100
+        n_users = len(users)
+        # n_users = 100
         if n_users < 2:
             print("クラスタリングに十分なユーザーが存在しません。")
             return
@@ -302,8 +304,11 @@ class ClusterAnalysis(Project_On):
             if len(user_series[user]) != target_length:
                 raise ValueError(f"Resample failed for user {user}")
         # --- (3) DTWと累積コスト行列の計算---
+        gc.collect()
         dtw_distances = np.zeros((n_users, n_users))
         for i in tqdm(range(n_users), desc="DTW Processing...", leave=True):
+            if i % 10 == 0:
+                gc.collect()
             for j in tqdm(
                 range(i + 1, n_users), desc=f"User_Number_{i} Processing...", leave=False
             ):
@@ -315,7 +320,8 @@ class ClusterAnalysis(Project_On):
                 filename = Path("cost_matrices") / f"cost_matrix_{i}_{j}.npy"
                 filename.parent.mkdir(parents=True, exist_ok=True)
                 np.save(filename, cost_matrix)
-
+                # メモリの解放促進
+                del cost_matrix
                 dtw_distances[i, j] = total_cost
                 dtw_distances[j, i] = total_cost
         print("==DTW Computed==")
@@ -342,7 +348,7 @@ class ClusterAnalysis(Project_On):
                     )
                     continue
 
-                avg_cost = np.zeros((target_length + 1, target_length + 1))
+                avg_cost = np.zeros((target_length, target_length))
                 count = 1
                 # クラスタ内の各ペアについて累積コスト行列を平均
                 for idx1 in range(len(cluster_indices)):
