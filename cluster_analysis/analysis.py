@@ -1,19 +1,30 @@
 import os
+import sys
 from pathlib import Path
 
-import matplotlib.colors as mcolors
-import matplotlib.pyplot as plt
-import numpy as np
-import pandas as pd
+sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
+import dtwmodule  # noqa
+import japanize_matplotlib  # noqa
+import matplotlib.colors as mcolors  # noqa
+import matplotlib.pyplot as plt  # noqa
+import numpy as np  # noqa
+import pandas as pd  # noqa
 import scipy.cluster.hierarchy as sch  # noqa
-import seaborn as sns
-from scipy.cluster.hierarchy import fcluster  # noqa
-from scipy.stats import gaussian_kde
-from sklearn.cluster import KMeans
-from sklearn.manifold import TSNE
+import seaborn as sns  # noqa
+from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa
+from scipy.spatial.distance import squareform  # noqas
+from scipy.stats import gaussian_kde  # noqa
+from sklearn.cluster import KMeans  # noqa
+from sklearn.manifold import TSNE  # noqa
+from tqdm import tqdm  # noqa
+from tslearn.clustering import KernelKMeans, TimeSeriesKMeans  # noqa
+from tslearn.metrics import dtw  # noqa
 
-from gender_axis.projection import Project_On
+from gender_axis.projection import Project_On  # noqa
+from util.utils import compute_dtw_accumulated_cost, resample_sequence  # noqa
 from word2vec.train import Trainer  # noqa
+
+# 必要なライブラリのインポート
 
 
 class ClusterAnalysis(Project_On):
@@ -67,7 +78,7 @@ class ClusterAnalysis(Project_On):
         plt.axis("off")
         FIG_PATH = self.base_dir / "plt" / "t-SNE_fig.png"
         plt.savefig(FIG_PATH)
-        plt.show()
+        # plt.show()
 
     def cluster_distribution(self):
         # 2.1 K-means のクラスタラベル + 書籍タイトルの DataFrame
@@ -128,8 +139,8 @@ class ClusterAnalysis(Project_On):
                 color = cmap(t)
 
                 ax.fill_between(
-                    X[i : i + 2],
-                    Y[i : i + 2],
+                    X[i : i + 2],  # noqa
+                    Y[i : i + 2],  # noqa
                     color=color,
                     interpolate=True,
                 )
@@ -163,7 +174,7 @@ class ClusterAnalysis(Project_On):
         fig_path = self.base_dir / "plt" / "cluster_distribution.png"
         fig_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(fig_path, dpi=300, bbox_inches="tight")
-        plt.show()
+        # plt.show()
 
         # 各クラスタ内の書籍タイトル例を表示
         for cl in range(self.num_cluster):
@@ -245,4 +256,140 @@ class ClusterAnalysis(Project_On):
         fig_path = self.base_dir / "plt" / "user_correlograms_from_dict.png"
         fig_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(fig_path, dpi=300, bbox_inches="tight")
-        plt.show()
+        # plt.show()
+
+    def dtw_kmeans_users(self, max_clusters=5, plot_heatmaps=True, gamma=0.01):
+        """
+        各ユーザーの読書順に沿った projection_vec を時系列データとみなし、
+        DTW距離を用いて TimeSeriesKMeans によるクラスタリングを実施します。
+
+        各ユーザーの読書履歴の長さが異なるため、線形補間により固定長にリサンプリングしています。
+        また、オプションで各クラスタの全ユーザー間の累積コスト行列をDTWで計算し、
+        平均したヒートマップを表示します。（ヒートマップのカラースケールは全クラスタで共通）
+        """
+
+        # --- (1) ユーザーごとの時系列データを抽出 ---
+        user_series = {}
+        for user in self.data_gen:
+            user_history = pd.DataFrame(self.data_gen[user])
+            if len(user_history) == 0:
+                continue
+            user_history["order"] = range(len(user_history))
+            user_history.rename(columns={"Title": "book_title"}, inplace=True)
+            merged = pd.merge(user_history, self.projection_result, on="book_title", how="inner")
+            merged = merged.sort_values("order")
+            try:
+                series = merged["projection_vec"].astype(float).values
+            except Exception as e:
+                print(f"User {user} の projection_vec の変換に失敗: {e}")
+                continue
+            if len(series) > 1:
+                user_series[user] = series
+
+        users = list(user_series.keys())
+        # n_users = len(users)
+        n_users = 100
+        if n_users < 2:
+            print("クラスタリングに十分なユーザーが存在しません。")
+            return
+
+        # --- (2) 固定長にリサンプリング ---
+        lengths = [len(seq) for seq in user_series.values()]
+        target_length = int(np.mean(lengths))
+        print(f"Target_length:{target_length}")
+        for user in users:
+            user_series[user] = resample_sequence(user_series[user], target_length)
+            if len(user_series[user]) != target_length:
+                raise ValueError(f"Resample failed for user {user}")
+        # --- (3) DTWと累積コスト行列の計算---
+        dtw_distances = np.zeros((n_users, n_users))
+        for i in tqdm(range(n_users), desc="DTW Processing...", leave=True):
+            for j in tqdm(
+                range(i + 1, n_users), desc=f"User_Number_{i} Processing...", leave=False
+            ):
+                seq1 = user_series[users[i]]
+                seq2 = user_series[users[j]]
+                cost_matrix, total_cost = dtwmodule.compute_dtw_with_matrix(seq1, seq2)
+
+                # メモリ不足になるので外部ファイルに保存する必要がある．
+                filename = Path("cost_matrices") / f"cost_matrix_{i}_{j}.npy"
+                filename.parent.mkdir(parents=True, exist_ok=True)
+                np.save(filename, cost_matrix)
+
+                dtw_distances[i, j] = total_cost
+                dtw_distances[j, i] = total_cost
+        print("==DTW Computed==")
+        # --- (4) クラスタリング (KernelKMeans: 事前計算済みDTW距離からカーネル行列を構築) ---
+        dtw_kernel = np.exp(-gamma * (dtw_distances**2))
+        kernel_km = KernelKMeans(n_clusters=5, kernel="precomputed", random_state=42)
+
+        cluster_labels = kernel_km.fit_predict(dtw_kernel)
+        print(np.unique(cluster_labels))
+        # --- (5) ヒートマップの作成 ---
+        if plot_heatmaps:
+            unique_clusters = np.unique(cluster_labels)
+            cluster_avg_costs = {}
+            cluster_sizes = {}
+            all_values = []
+
+            for cl in unique_clusters:
+                # クラスタに属するユーザーのインデックスリスト
+                cluster_indices = [i for i in range(n_users) if cluster_labels[i] == cl]
+                cluster_sizes[cl] = len(cluster_indices)
+                if len(cluster_indices) < 2:
+                    print(
+                        f"Cluster {cl} のユーザー数が1件のため、ヒートマップ表示をスキップします。"
+                    )
+                    continue
+
+                avg_cost = np.zeros((target_length + 1, target_length + 1))
+                count = 1
+                # クラスタ内の各ペアについて累積コスト行列を平均
+                for idx1 in range(len(cluster_indices)):
+                    for idx2 in range(idx1 + 1, len(cluster_indices)):
+                        i = cluster_indices[idx1]
+                        j = cluster_indices[idx2]
+
+                        filename = Path("cost_matrices") / f"cost_matrix_{i}_{j}.npy"
+                        if filename.exists():
+                            cost_matrix = np.load(file=filename)
+                        else:
+                            continue
+                        if cost_matrix.shape != avg_cost.shape:
+                            print(
+                                f"Shape mismatch: skipping cost_matrix_{i}_{j}.npy (got {cost_matrix.shape})"  # noqa
+                            )
+                            continue
+                        avg_cost += cost_matrix
+                        count += 1
+                avg_cost /= count
+                cluster_avg_costs[cl] = avg_cost
+                all_values.extend(avg_cost.flatten())
+
+            if all_values:
+                global_min = np.min(all_values)
+                global_max = np.max(all_values)
+                print(f"Global min: {global_min}, Global max: {global_max}")
+            else:
+                print("ヒートマップ用のデータがありません。")
+                return
+
+            # 全クラスタ共通のカラースケールでヒートマップ描画
+            for cl in unique_clusters:
+                if cl not in cluster_avg_costs:
+                    continue
+                avg_cost = cluster_avg_costs[cl]
+                plt.figure(figsize=(6, 5))
+                sns.heatmap(
+                    avg_cost,
+                    cmap="hot",
+                    cbar=True,
+                    vmin=global_min,
+                    vmax=global_max,
+                )
+                plt.title(f"Cluster {cl}: 平均累積コスト行列 (ユーザー数: {cluster_sizes[cl]})")
+                plt.xlabel("時系列インデックス")
+                plt.ylabel("時系列インデックス")
+                fig_path = self.base_dir / "plt" / f"{cl}_dtw_cost_map.png"
+                fig_path.parent.mkdir(parents=True, exist_ok=True)
+                plt.savefig(fig_path, dpi=300, bbox_inches="tight")

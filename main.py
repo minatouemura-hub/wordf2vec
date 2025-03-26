@@ -12,7 +12,7 @@ def main():
     BASE_DIR = Path(__file__).resolve().parent  # noqa
     DATA_PATH = BASE_DIR / "data" / "all_users_results.json"
     WEIGHT_PATH = BASE_DIR / "weight_vec" / "book2vec_model.pth"
-    PROJECTION_RESULT = BASE_DIR / "result" / "projection_result.csv"  # noqas
+    PROJECTION_RESULT = BASE_DIR / "result" / "projection_result.csv"  # noqa
 
     clster_analysis = ClusterAnalysis(
         base_dir=BASE_DIR,
@@ -25,7 +25,8 @@ def main():
 
     clster_analysis.k_means_tsne_plt()
     clster_analysis.cluster_distribution()
-    clster_analysis.make_correlogram_from_dict()
+    # clster_analysis.make_correlogram_from_dict()
+    clster_analysis.dtw_kmeans_users(max_clusters=5)
 
 
 if __name__ == "__main__":
