@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
-import gc
+import gc  # noqa
 
 import dtwmodule  # noqa
 import japanize_matplotlib  # noqa
@@ -23,7 +23,7 @@ from tslearn.clustering import KernelKMeans, TimeSeriesKMeans  # noqa
 from tslearn.metrics import dtw  # noqa
 
 from gender_axis.projection import Project_On  # noqa
-from util.utils import compute_dtw_accumulated_cost, resample_sequence  # noqa
+from util.utils import foulier_decomp, plt_linear, resample_sequence  # noqa
 from word2vec.train import Trainer  # noqa
 
 # 必要なライブラリのインポート
@@ -288,32 +288,41 @@ class ClusterAnalysis(Project_On):
             if len(series) > 1:
                 user_series[user] = series
 
-        users = list(user_series.keys())
-        n_users = len(users)
-        # n_users = 100
+        # n_users = len(users)
+        n_users = 100
         if n_users < 2:
             print("クラスタリングに十分なユーザーが存在しません。")
             return
 
         # --- (2) 固定長にリサンプリング ---
-        lengths = [len(seq) for seq in user_series.values()]
-        target_length = int(np.mean(lengths))
+        # lengths = [len(seq) for seq in user_series.values()]
+        # target_length = int(np.mean(lengths))
+        target_length = 100
         print(f"Target_length:{target_length}")
-        for user in users:
-            user_series[user] = resample_sequence(user_series[user], target_length)
-            if len(user_series[user]) != target_length:
-                raise ValueError(f"Resample failed for user {user}")
+        user_series = {
+            user: seq[:target_length]
+            for user, seq in user_series.items()
+            if len(seq) >= target_length
+        }
+        # == 線形補完は良くない ==
+        # for user in users:
+        #     user_series[user] = resample_sequence(user_series[user], target_length)
+        #     if len(user_series[user]) != target_length:
+        #         raise ValueError(f"Resample failed for user {user}")
+
         # --- (3) DTWと累積コスト行列の計算---
         gc.collect()
         dtw_distances = np.zeros((n_users, n_users))
+        user_id = list(user_series.keys())
         for i in tqdm(range(n_users), desc="DTW Processing...", leave=True):
             if i % 10 == 0:
                 gc.collect()
             for j in tqdm(
                 range(i + 1, n_users), desc=f"User_Number_{i} Processing...", leave=False
             ):
-                seq1 = user_series[users[i]]
-                seq2 = user_series[users[j]]
+
+                seq1 = user_series[user_id[i]]
+                seq2 = user_series[user_id[j]]
                 cost_matrix, total_cost = dtwmodule.compute_dtw_with_matrix(seq1, seq2)
 
                 # メモリ不足になるので外部ファイルに保存する必要がある．
@@ -330,7 +339,7 @@ class ClusterAnalysis(Project_On):
         kernel_km = KernelKMeans(n_clusters=5, kernel="precomputed", random_state=42)
 
         cluster_labels = kernel_km.fit_predict(dtw_kernel)
-        print(np.unique(cluster_labels))
+        plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
         # --- (5) ヒートマップの作成 ---
         if plot_heatmaps:
             unique_clusters = np.unique(cluster_labels)
