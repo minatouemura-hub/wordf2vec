@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from tslearn.barycenters import dtw_barycenter_averaging
 
 
 def compute_dtw_accumulated_cost(x, y):
@@ -31,51 +32,33 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
     n_clusters = len(np.unique(labels))
     n_rows = int(np.ceil(n_clusters / 2))
 
-    # === グラフ全体を2段構成（上段: 折れ線, 下段: ボックスプロット） ===
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(n_rows + 1, 2, height_ratios=[1] * n_rows + [0.5])
 
-    dominat_freqs = []
+    dominant_freqs = []
+    target_len = 128
 
-    # --- クラスタごとの折れ線プロット ---
     for cl in range(n_clusters):
         row, col = divmod(cl, 2)
         ax = fig.add_subplot(gs[row, col])
         cluster_indices = np.where(labels == cl)[0]
         user_ids = list(data_gen.keys())
-        # cluster_data: list of arrays
         cluster_data = [data_gen[user_ids[i]] for i in cluster_indices]
 
-        # 各系列の長さを調べて最小長さに合わせて整形する（例）
-        min_len = min(len(series) for series in cluster_data)
-        cluster_data_trimmed = np.array([series[:min_len] for series in cluster_data])
+        # リサンプルして長さを統一
+        cluster_data_resampled = np.array(
+            [resample_sequence(series, target_len) for series in cluster_data]
+        )
 
-        # 周波数分解（関数は別定義されている想定）
-        dominat_freqs = foulier_decomp(cl, cl_data=cluster_data, dominant_freqs=dominat_freqs)
-        dom_freq = np.median([f for c, f in dominat_freqs if c == cl])
-        if dom_freq > 0:
-            period = int(1 / dom_freq)
-            n_cycles = 1
-            x_max = min(cluster_data.shape[1], n_cycles * period)
-        else:
-            x_max = cluster_data.shape[1]
-        # 各系列とその平均
-        padded_data = []
-        for series in cluster_data:
-            trimmed = series[:x_max]
-            ax.plot(trimmed, color="black", alpha=0.1)
-            padded = np.pad(trimmed, (0, x_max - len(trimmed)), constant_values=np.nan)
-            padded_data.append(padded)
-        padded_data = np.array(padded_data)
+        # 各系列を描画
+        for series in cluster_data_resampled:
+            ax.plot(series, color="black", alpha=0.1)
 
-        cluster_center = np.nanmean(padded_data, axis=0)
+        # DTWバリセンターをクラスタ中心とする
+        cluster_center = dtw_barycenter_averaging(cluster_data_resampled)
         ax.plot(cluster_center, color="red", linewidth=2)
 
-        if dom_freq > 0:
-            tick_positions = np.arange(0, x_max + 1, period)
-            ax.set_xticks(tick_positions)
-            ax.set_xticklabels([f"{i+1}周期" for i in range(len(tick_positions))])
-        ax.set_xlim(0, x_max)
+        ax.set_xlim(0, target_len)
         ax.set_ylabel("projection value")
         ax.set_title(f"Cluster {cl}")
 
@@ -83,14 +66,13 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
     for i in range(n_clusters, n_rows * 2):
         fig.add_subplot(gs[i // 2, i % 2]).axis("off")
 
-    # --- ボックスプロット（主周波数分布）---
-    df_freqs = pd.DataFrame(dominat_freqs, columns=["cluster", "dominant_freq"])
+    # --- 周波数分布の仮プロット（未使用なら空プロットに） ---
+    df_freqs = pd.DataFrame(dominant_freqs or [(0, 0)], columns=["cluster", "dominant_freq"])
     ax_box = fig.add_subplot(gs[-1, :])
     sns.boxplot(data=df_freqs, x="cluster", y="dominant_freq", ax=ax_box)
     ax_box.set_title("Dominant Frequencies per Cluster")
 
-    # --- 全体調整 & 保存 ---
-    fig.suptitle("DTW distance K-means Clustering + Frequency Analysis", fontsize=16)
+    fig.suptitle("DTW distance K-means Clustering + DTW Barycenter Visualization", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     output_path.mkdir(parents=True, exist_ok=True)
     plt.savefig(output_path / "dtw_cluster_plot.png")

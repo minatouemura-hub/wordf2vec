@@ -315,7 +315,7 @@ class ClusterAnalysis(Project_On):
         cluster_labels = kernel_km.fit_predict(dtw_kernel)
 
         self.plot_relative_gender_ratio_by_cluster(cluster_labels=cluster_labels, user_ids=user_ids)
-        # plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
+        plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
 
     def plot_relative_gender_ratio_by_cluster(self, cluster_labels, user_ids):
         """
