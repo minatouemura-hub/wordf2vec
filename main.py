@@ -26,7 +26,7 @@ def main():
     clster_analysis.k_means_tsne_plt()
     clster_analysis.cluster_distribution()
     # clster_analysis.make_correlogram_from_dict()
-    clster_analysis.dtw_kmeans_users(max_clusters=5)
+    clster_analysis.dtw_kmeans_users(max_clusters=5, plt_flag=True)
 
 
 if __name__ == "__main__":

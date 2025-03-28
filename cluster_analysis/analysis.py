@@ -5,7 +5,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
 import gc  # noqa
 
-import dtwmodule  # noqa
+import fastdtwmodule
 import japanize_matplotlib  # noqa
 import matplotlib.colors as mcolors  # noqa
 import matplotlib.pyplot as plt  # noqa
@@ -14,13 +14,13 @@ import pandas as pd  # noqa
 import scipy.cluster.hierarchy as sch  # noqa
 import seaborn as sns  # noqa
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa
-from scipy.spatial.distance import squareform  # noqas
+from scipy.spatial.distance import euclidean  # noqa
+from scipy.spatial.distance import squareform  # noqa
 from scipy.stats import gaussian_kde  # noqa
 from sklearn.cluster import KMeans  # noqa
 from sklearn.manifold import TSNE  # noqa
 from tqdm import tqdm  # noqa
 from tslearn.clustering import KernelKMeans, TimeSeriesKMeans  # noqa
-from tslearn.metrics import dtw  # noqa
 
 from gender_axis.projection import Project_On  # noqa
 from util.utils import foulier_decomp, plt_linear, resample_sequence  # noqa
@@ -260,7 +260,7 @@ class ClusterAnalysis(Project_On):
         plt.savefig(fig_path, dpi=300, bbox_inches="tight")
         # plt.show()
 
-    def dtw_kmeans_users(self, max_clusters=5, plot_heatmaps=True, gamma=0.01):
+    def dtw_kmeans_users(self, max_clusters=5, plt_flag=True, gamma=0.01):
         """
         各ユーザーの読書順に沿った projection_vec を時系列データとみなし、
         DTW距離を用いて TimeSeriesKMeans によるクラスタリングを実施します。
@@ -288,123 +288,68 @@ class ClusterAnalysis(Project_On):
             if len(series) > 1:
                 user_series[user] = series
 
-        # n_users = len(users)
-        n_users = 100
+        user_ids = list(user_series.keys())
+        n_users = len(user_ids)
         if n_users < 2:
             print("クラスタリングに十分なユーザーが存在しません。")
             return
-
-        # --- (2) 固定長にリサンプリング ---
-        # lengths = [len(seq) for seq in user_series.values()]
-        # target_length = int(np.mean(lengths))
-        target_length = 100
-        print(f"Target_length:{target_length}")
-        user_series = {
-            user: seq[:target_length]
-            for user, seq in user_series.items()
-            if len(seq) >= target_length
-        }
-        # == 線形補完は良くない ==
-        # for user in users:
-        #     user_series[user] = resample_sequence(user_series[user], target_length)
-        #     if len(user_series[user]) != target_length:
-        #         raise ValueError(f"Resample failed for user {user}")
-
         # --- (3) DTWと累積コスト行列の計算---
         gc.collect()
-        dtw_distances = np.zeros((n_users, n_users))
-        user_id = list(user_series.keys())
+        dtw_distances = np.zeros((n_users, n_users), dtype=np.float32)
         for i in tqdm(range(n_users), desc="DTW Processing...", leave=True):
-            if i % 10 == 0:
-                gc.collect()
             for j in tqdm(
                 range(i + 1, n_users), desc=f"User_Number_{i} Processing...", leave=False
             ):
+                seq1 = user_series[user_ids[i]]
+                seq2 = user_series[user_ids[j]]
 
-                seq1 = user_series[user_id[i]]
-                seq2 = user_series[user_id[j]]
-                cost_matrix, total_cost = dtwmodule.compute_dtw_with_matrix(seq1, seq2)
+                dist = fastdtwmodule.fastdtw(seq1, seq2)
 
-                # メモリ不足になるので外部ファイルに保存する必要がある．
-                filename = Path("cost_matrices") / f"cost_matrix_{i}_{j}.npy"
-                filename.parent.mkdir(parents=True, exist_ok=True)
-                np.save(filename, cost_matrix)
-                # メモリの解放促進
-                del cost_matrix
-                dtw_distances[i, j] = total_cost
-                dtw_distances[j, i] = total_cost
+                dtw_distances[i, j] = dist
+                dtw_distances[j, i] = dist
         print("==DTW Computed==")
         # --- (4) クラスタリング (KernelKMeans: 事前計算済みDTW距離からカーネル行列を構築) ---
         dtw_kernel = np.exp(-gamma * (dtw_distances**2))
         kernel_km = KernelKMeans(n_clusters=5, kernel="precomputed", random_state=42)
 
         cluster_labels = kernel_km.fit_predict(dtw_kernel)
-        plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
-        # --- (5) ヒートマップの作成 ---
-        if plot_heatmaps:
-            unique_clusters = np.unique(cluster_labels)
-            cluster_avg_costs = {}
-            cluster_sizes = {}
-            all_values = []
 
-            for cl in unique_clusters:
-                # クラスタに属するユーザーのインデックスリスト
-                cluster_indices = [i for i in range(n_users) if cluster_labels[i] == cl]
-                cluster_sizes[cl] = len(cluster_indices)
-                if len(cluster_indices) < 2:
-                    print(
-                        f"Cluster {cl} のユーザー数が1件のため、ヒートマップ表示をスキップします。"
-                    )
-                    continue
+        self.plot_relative_gender_ratio_by_cluster(cluster_labels=cluster_labels, user_ids=user_ids)
+        # plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
 
-                avg_cost = np.zeros((target_length, target_length))
-                count = 1
-                # クラスタ内の各ペアについて累積コスト行列を平均
-                for idx1 in range(len(cluster_indices)):
-                    for idx2 in range(idx1 + 1, len(cluster_indices)):
-                        i = cluster_indices[idx1]
-                        j = cluster_indices[idx2]
+    def plot_relative_gender_ratio_by_cluster(self, cluster_labels, user_ids):
+        """
+        各性別に対して「このクラスタでは相対的に多いか？」を示すヒートマップを表示
 
-                        filename = Path("cost_matrices") / f"cost_matrix_{i}_{j}.npy"
-                        if filename.exists():
-                            cost_matrix = np.load(file=filename)
-                        else:
-                            continue
-                        if cost_matrix.shape != avg_cost.shape:
-                            print(
-                                f"Shape mismatch: skipping cost_matrix_{i}_{j}.npy (got {cost_matrix.shape})"  # noqa
-                            )
-                            continue
-                        avg_cost += cost_matrix
-                        count += 1
-                avg_cost /= count
-                cluster_avg_costs[cl] = avg_cost
-                all_values.extend(avg_cost.flatten())
+        Parameters:
+            cluster_labels (np.array): 各ユーザーのクラスタラベル
+            user_ids (List[str]): user_seriesのキー（ユーザーID）リストと一致
+        """
+        gender_data = []
 
-            if all_values:
-                global_min = np.min(all_values)
-                global_max = np.max(all_values)
-                print(f"Global min: {global_min}, Global max: {global_max}")
-            else:
-                print("ヒートマップ用のデータがありません。")
-                return
+        for idx, user_id in enumerate(user_ids):
+            gender = self.data_gen[user_id][0].get("Gender", "Unknown")
+            cluster = cluster_labels[idx]
+            gender_data.append({"cluster": cluster, "gender": gender})
 
-            # 全クラスタ共通のカラースケールでヒートマップ描画
-            for cl in unique_clusters:
-                if cl not in cluster_avg_costs:
-                    continue
-                avg_cost = cluster_avg_costs[cl]
-                plt.figure(figsize=(6, 5))
-                sns.heatmap(
-                    avg_cost,
-                    cmap="hot",
-                    cbar=True,
-                    vmin=global_min,
-                    vmax=global_max,
-                )
-                plt.title(f"Cluster {cl}: 平均累積コスト行列 (ユーザー数: {cluster_sizes[cl]})")
-                plt.xlabel("時系列インデックス")
-                plt.ylabel("時系列インデックス")
-                fig_path = self.base_dir / "plt" / f"{cl}_dtw_cost_map.png"
-                fig_path.parent.mkdir(parents=True, exist_ok=True)
-                plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+        df = pd.DataFrame(gender_data)
+
+        # クロス集計: クラスタ×性別 の人数テーブル
+        crosstab = pd.crosstab(df["gender"], df["cluster"])
+
+        # 性別ごとに z-score を計算（クラスタ内での偏りを相対評価）
+        zscore_df = crosstab.apply(lambda x: (x - x.mean()) / x.std(), axis=1)
+
+        # ヒートマップ描画
+        plt.figure(figsize=(10, 5))
+        sns.heatmap(zscore_df, annot=True, cmap="RdBu_r", center=0, fmt=".2f")
+
+        plt.title("Relative Gender Ratio by Cluster (Z-score)")
+        plt.xlabel("Cluster")
+        plt.ylabel("Gender")
+        plt.tight_layout()
+
+        fig_path = self.base_dir / "plt" / "gender_ratio_relative_zscore.png"
+        fig_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.savefig(fig_path, dpi=300)
+        plt.close()

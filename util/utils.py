@@ -43,7 +43,12 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
         ax = fig.add_subplot(gs[row, col])
         cluster_indices = np.where(labels == cl)[0]
         user_ids = list(data_gen.keys())
-        cluster_data = np.array([data_gen[user_ids[i]] for i in cluster_indices])
+        # cluster_data: list of arrays
+        cluster_data = [data_gen[user_ids[i]] for i in cluster_indices]
+
+        # 各系列の長さを調べて最小長さに合わせて整形する（例）
+        min_len = min(len(series) for series in cluster_data)
+        cluster_data_trimmed = np.array([series[:min_len] for series in cluster_data])
 
         # 周波数分解（関数は別定義されている想定）
         dominat_freqs = foulier_decomp(cl, cl_data=cluster_data, dominant_freqs=dominat_freqs)
@@ -55,10 +60,15 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
         else:
             x_max = cluster_data.shape[1]
         # 各系列とその平均
+        padded_data = []
         for series in cluster_data:
-            ax.plot(series[:x_max], color="black", alpha=0.1)
-        cluster_center = cluster_data[:, :x_max].mean(axis=0)
+            trimmed = series[:x_max]
+            ax.plot(trimmed, color="black", alpha=0.1)
+            padded = np.pad(trimmed, (0, x_max - len(trimmed)), constant_values=np.nan)
+            padded_data.append(padded)
+        padded_data = np.array(padded_data)
 
+        cluster_center = np.nanmean(padded_data, axis=0)
         ax.plot(cluster_center, color="red", linewidth=2)
 
         if dom_freq > 0:
@@ -66,6 +76,7 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
             ax.set_xticks(tick_positions)
             ax.set_xticklabels([f"{i+1}周期" for i in range(len(tick_positions))])
         ax.set_xlim(0, x_max)
+        ax.set_ylabel("projection value")
         ax.set_title(f"Cluster {cl}")
 
     # --- 余った subplot 埋める ---
@@ -94,6 +105,9 @@ def foulier_decomp(
     for series in cl_data:
         fft_vals = np.fft.fft(series - np.mean(series))
         freqs = np.fft.fftfreq(len(series))
-        dominant = freqs[np.argmax(np.abs(fft_vals[1 : len(freqs) // 2]))]  # noqa
+        mag = np.abs(fft_vals[1 : len(freqs) // 2])
+        if mag.size == 0:
+            continue
+        dominant = freqs[1 : len(freqs) // 2][np.argmax(mag)]  # noqa
         dominant_freqs.append((cl, dominant))
     return dominant_freqs
