@@ -1,8 +1,9 @@
-import os
+import os  # noqa
 import sys
 from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
+import argparse  # noqa
 import gc  # noqa
 
 import fastdtwmodule
@@ -36,13 +37,25 @@ class ClusterAnalysis(Project_On):
         folder_path: Path,
         weight_path: Path,
         result_path: Path,
+        whole_args,
+        projection_args,
+        word2vec_config,
         num_cluster: int = 10,
         num_samples: int = 10000,
     ):
-        Project_On.__init__(self, base_dir, folder_path, weight_path)
+        Project_On.__init__(
+            self,
+            base_dir,
+            folder_path,
+            weight_path,
+            whole_args=whole_args,
+            projection_args=projection_args,
+            word2vec_config=word2vec_config,
+        )
         self.num_cluster = num_cluster
         self.num_samples = num_samples
-        if not os.path.isfile(result_path):
+        self.whole_args = whole_args
+        if whole_args.recompute_axis:
             self.projection()
         self.projection_result = self._read_projection_result(result_path)
         self.base_dir = base_dir

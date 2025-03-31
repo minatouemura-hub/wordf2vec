@@ -6,10 +6,12 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F  # noqa
 import torch.optim as optim
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
 # 文脈-user_id , 単語 - 本のタイトル(著者)
@@ -20,6 +22,12 @@ from tqdm import tqdm
 class BookDataset(object):
     def __init__(self, folder_path: str):
         self.folder_path = folder_path
+
+    def execute(self):
+        self._load_dataset()
+        self._norm_titles()
+        self.gender_counter()
+        self.mapping()
 
     def _load_dataset(self):
         with open(
@@ -44,7 +52,7 @@ class BookDataset(object):
         )
         number_pattern = r"(?:\d+|[零一二三四五六七八九十百千万億兆]+)"
         patterns = [
-            # (r"全\s*[\d一二三四五六七八九十]+巻?", ""),
+            (r"\s*全\s*\d+\s*巻(セット|完結)?(?:\s*\[.*?\])?", ""),  # より汎用的に
             # 新規パターン: タイトルが【...】で始まり、「~」がある場合、最初の「~」以降を除去する
             (r"^(?:【.*?】)\s*(.+?~.+?~).*$", r"\1"),
             # 新規パターン: タイトル末尾に空白＋数字＋括弧内の不要情報がある場合、先頭部分のみ抽出
@@ -177,10 +185,11 @@ class BookDataset(object):
 
 
 # 埋め込み表現
-class UserBook2Vec(nn.Module, BookDataset):
+class UserBook2Vec(nn.Module):
     def __init__(
         self,
         folder_path: str,
+        dataset: "BookDataset" = None,
         embedding_dim: int = 50,
         num_negatives: int = 5,
         batch_size: int = 4,
@@ -190,13 +199,11 @@ class UserBook2Vec(nn.Module, BookDataset):
         # まず nn.Module の初期化を行う
         nn.Module.__init__(self)
         # BookDataset の初期化も行う（UserBook2Vec が BookDataset を継承しているので）
-        BookDataset.__init__(self, folder_path)
-
-        # データの読み込み
-        self._load_dataset()
-        self._norm_titles()
-        self.gender_counter()
-        self.mapping()
+        if dataset is not None:
+            self.__dict__.update(dataset.__dict__)
+        else:
+            BookDataset.__init__(self, folder_path)
+            self.execute()
 
         self.num_users = len(self.user2id)
         self.vocab_size = len(self.book2id)
@@ -246,13 +253,22 @@ class Trainer(UserBook2Vec):
         self,
         folder_path: Path,
         weight_path: Path,
+        dataset: "BookDataset" = None,
         embedding_dim=50,
         num_negatives=5,
         batch_size=32,
         epochs=5,
         learning_rate=0.005,
     ):
-        UserBook2Vec.__init__(self, folder_path=folder_path)
+        UserBook2Vec.__init__(
+            self,
+            folder_path=folder_path,
+            dataset=dataset,
+            batch_size=batch_size,
+            num_negatives=num_negatives,
+            epochs=epochs,
+            learning_rate=learning_rate,
+        )
 
         self.weight_path = weight_path
 
@@ -270,7 +286,6 @@ class Trainer(UserBook2Vec):
         pairs = np.array(self.pairs)  # shape: (num_pairs, 2)
         num_batches = int(np.ceil(len(pairs) / self.batch_size))
 
-        print("\n=== 訓練開始 ===")
         for epoch in tqdm(range(self.epochs), desc="Epoch Processing", leave=False):
             np.random.shuffle(pairs)
             total_loss = 0.0
@@ -309,6 +324,8 @@ class Trainer(UserBook2Vec):
 
         print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
         self._save_wight_vec()
+        acc = self._eval_analogy(analogy_path=self.folder_path.parent / "analogy_task.csv")
+        return acc
 
     def _save_wight_vec(self):
         torch.save(self.state_dict(), self.weight_path)
@@ -319,3 +336,30 @@ class Trainer(UserBook2Vec):
             torch.load(self.weight_path, map_location=torch.device(device), weights_only=True)
         )
         self.eval()
+
+    def _eval_analogy(self, analogy_path: Path, thereshold: float = 0.6):
+        analogy_df = pd.read_csv(analogy_path)
+
+        total = len(analogy_df)
+        correct = 0
+
+        for _, row in analogy_df.iterrows():
+            analogy_list = [row["A"], row["B"], row["C"], row["D"]]
+            for analogy_title in analogy_list:
+                if analogy_title not in self.book2id.keys():
+                    raise ValueError(f"{analogy_title} not in book_dict")
+
+            vec_a = self.book_embeddings[self.book2id[analogy_list[0]]]
+            vec_b = self.book_embeddings[self.book2id[analogy_list[1]]]
+            vec_c = self.book_embeddings[self.book2id[analogy_list[2]]]
+            vec_d = self.book_embeddings[self.book2id[analogy_list[3]]]
+
+            predic_vec = vec_b - vec_a + vec_c
+
+            sim = cosine_similarity(predic_vec.reshape(1, -1), vec_d.reshape(1, -1))
+            if sim > thereshold:
+                correct += 1
+        acc = correct / total if total > 0 else 0.0
+        print(sim)
+        print(f"Accuracy:{acc} based on threshold:{thereshold}")
+        return acc
