@@ -17,7 +17,9 @@ class Word2VecCongig:
     negative_range: list = field(default_factory=lambda: [10, 35])  # negative sampling
     alpha_range: list = field(default_factory=lambda: [0.01, 0.1])  # 初期学習率
     size_range: list = field(default_factory=lambda: [100, 150])  # 埋め込みベクトルの次元
-
+    # down_sampleの追加
+    down_sample: bool = True
+    sample: float = 1e-4
     embedding_dim: int = 150
     num_negatives: int = 15
     batch_size: int = 124

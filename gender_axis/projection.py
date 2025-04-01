@@ -32,6 +32,8 @@ class Project_On(Trainer):
         self.base_dir = base_dir
         self.top_k = top_k
         self.projection_args = projection_args
+        down_sample = word2vec_config.down_sample
+        sample = word2vec_config.sample
         dataset = BookDataset(folder_path)
         dataset.execute()
 

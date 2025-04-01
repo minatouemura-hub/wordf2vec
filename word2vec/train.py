@@ -20,8 +20,10 @@ from tqdm import tqdm
 
 # データの読み込み
 class BookDataset(object):
-    def __init__(self, folder_path: str):
+    def __init__(self, folder_path: str, down_sample: bool = True, sample: float = 1e-4):
         self.folder_path = folder_path
+        self.down_sample = down_sample
+        self.sample = sample
 
     def execute(self):
         self._load_dataset()
@@ -145,9 +147,7 @@ class BookDataset(object):
             print(f"{book}: 女性{female_read_counts[book]}回, 男性{male_read_counts.get(book,0)}回")
 
     def mapping(self):
-        ##############################################
-        # 2. ユーザーID と 書籍（Title）のマッピング作成
-        ##############################################
+
         user_id = list(self.data_gen.keys())
         self.user2id = {uid: i for i, uid in enumerate(user_id)}
 
@@ -165,23 +165,24 @@ class BookDataset(object):
         for i, book in enumerate(self.book_counts.keys()):
             self.book2id[book] = i
             self.id2book[i] = book
-
-        ##############################################
-        # 3. 学習データの作成： (user, book) ペア
-        ##############################################
-
         self.pairs = []
+        if self.down_sample:
+            total_count = sum(self.book_counts.values())
+            book_freq = {b: c / total_count for b, c in self.book_counts.items()}
+            self.book_keep_prob = {
+                b: 1 - np.sqrt(self.sample / f) if f > self.sample else 1.0
+                for b, f in book_freq.items()
+            }
         for uid, books in tqdm(self.data_gen.items(), desc="Processing Pairing"):
             user_idx = self.user2id[uid]
             for book in books:
                 book_identifier = book["Title"]
+                if self.down_sample and np.random.rand() < self.book_keep_prob.get(
+                    book_identifier, 1.0
+                ):
+                    continue
                 book_idx = self.book2id[book_identifier]
                 self.pairs.append((user_idx, book_idx))
-
-
-##############################################
-# 5. PyTorch によるユーザー・書籍埋め込みモデルの定義
-##############################################
 
 
 # 埋め込み表現
