@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F  # noqa
 import torch.optim as optim
 from sklearn.metrics.pairwise import cosine_similarity
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR
 from tqdm import tqdm
 
 # 文脈-user_id , 単語 - 本のタイトル(著者)
@@ -260,6 +261,8 @@ class Trainer(UserBook2Vec):
         batch_size=32,
         epochs=5,
         learning_rate=0.005,
+        early_stop_threshold: float = 0.001,
+        cos_threshold: float = 0.6,
     ):
         UserBook2Vec.__init__(
             self,
@@ -272,7 +275,7 @@ class Trainer(UserBook2Vec):
         )
 
         self.weight_path = weight_path
-
+        self.early_stop_threshold = early_stop_threshold
         self.embedding_dim = embedding_dim
         self.num_negatives = num_negatives
         self.batch_size = batch_size
@@ -280,12 +283,16 @@ class Trainer(UserBook2Vec):
         self.learning_rate = learning_rate
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
+        self.cos_threshold = cos_threshold
+
     def run_train(self):
         self.to(self.device)
         optimizer = optim.Adam(self.parameters(), lr=self.learning_rate)
-
+        # scheduler = StepLR(optimizer=optimizer, step_size=10, gamma=0.5)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
         pairs = np.array(self.pairs)  # shape: (num_pairs, 2)
         num_batches = int(np.ceil(len(pairs) / self.batch_size))
+        prev_loss = None
 
         for epoch in tqdm(range(self.epochs), desc="Epoch Processing", leave=False):
             np.random.shuffle(pairs)
@@ -315,17 +322,19 @@ class Trainer(UserBook2Vec):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
+            scheduler.step(total_loss)
             print(f"Epoch {epoch+1}/{self.epochs} Loss: {total_loss/num_batches:.4f}")
+            if prev_loss is not None and abs(prev_loss - total_loss) < self.early_stop_threshold:
+                break
+            prev_loss = total_loss
 
-        ##############################################
-        # 7. 学習結果の確認：書籍埋め込みと識別子対応
-        ##############################################
-        # 学習後、書籍側の埋め込みを取得
         self.book_embeddings = self.book_embed.weight.data.cpu().numpy()
 
         print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
         self._save_wight_vec()
-        acc = self._eval_analogy(analogy_path=self.folder_path.parent / "analogy_task.csv")
+        acc = self._eval_analogy(
+            analogy_path=self.folder_path.parent / "analogy_task.csv", thereshold=self.cos_threshold
+        )
         return acc
 
     def _save_wight_vec(self):
@@ -360,7 +369,7 @@ class Trainer(UserBook2Vec):
             sim = cosine_similarity(predic_vec.reshape(1, -1), vec_d.reshape(1, -1))
             if sim > thereshold:
                 correct += 1
+            print(sim)
         acc = correct / total if total > 0 else 0.0
-        print(sim)
         print(f"Accuracy:{acc} based on threshold:{thereshold}")
         return acc

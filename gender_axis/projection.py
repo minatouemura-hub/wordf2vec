@@ -34,7 +34,7 @@ class Project_On(Trainer):
         self.projection_args = projection_args
         down_sample = word2vec_config.down_sample
         sample = word2vec_config.sample
-        dataset = BookDataset(folder_path)
+        dataset = BookDataset(folder_path, down_sample=down_sample, sample=sample)
         dataset.execute()
 
         if os.path.isfile(weight_path) and not whole_args.retrain:
@@ -78,6 +78,7 @@ class Project_On(Trainer):
                     learning_rate=word2vec_config.learning_rate,
                     batch_size=word2vec_config.batch_size,
                     epochs=word2vec_config.epochs,
+                    early_stop_threshold=word2vec_config.early_stop_threshold,
                 )
                 acc = self.run_train()
 

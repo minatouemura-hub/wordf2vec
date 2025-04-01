@@ -14,17 +14,22 @@ class WholeConfig:
 @dataclass
 class Word2VecCongig:
     # sample_range: list = [1e-3, 1e-4]  # 高頻度のダウンサンプリング
+    # == grid_search用 ==
     negative_range: list = field(default_factory=lambda: [10, 35])  # negative sampling
     alpha_range: list = field(default_factory=lambda: [0.01, 0.1])  # 初期学習率
     size_range: list = field(default_factory=lambda: [100, 150])  # 埋め込みベクトルの次元
+    # ==
     # down_sampleの追加
     down_sample: bool = True
     sample: float = 1e-4
     embedding_dim: int = 150
     num_negatives: int = 15
     batch_size: int = 124
-    epochs: int = 20
+    epochs: int = 40
     learning_rate: float = 0.01
+    early_stop_threshold: float = 0.001
+
+    cos_threshold: float = 0.5
 
 
 @dataclass
