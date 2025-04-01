@@ -79,6 +79,8 @@ class Project_On(Trainer):
                     batch_size=word2vec_config.batch_size,
                     epochs=word2vec_config.epochs,
                     early_stop_threshold=word2vec_config.early_stop_threshold,
+                    top_range=word2vec_config.top_range,
+                    eval_task=word2vec_config.task_name,
                 )
                 acc = self.run_train()
 

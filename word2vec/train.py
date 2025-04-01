@@ -262,7 +262,8 @@ class Trainer(UserBook2Vec):
         epochs=5,
         learning_rate=0.005,
         early_stop_threshold: float = 0.001,
-        cos_threshold: float = 0.6,
+        top_range: int = 5,
+        eval_task: str = "sim_task",
     ):
         UserBook2Vec.__init__(
             self,
@@ -273,7 +274,7 @@ class Trainer(UserBook2Vec):
             epochs=epochs,
             learning_rate=learning_rate,
         )
-
+        self.eval_task = eval_task
         self.weight_path = weight_path
         self.early_stop_threshold = early_stop_threshold
         self.embedding_dim = embedding_dim
@@ -283,7 +284,7 @@ class Trainer(UserBook2Vec):
         self.learning_rate = learning_rate
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
-        self.cos_threshold = cos_threshold
+        self.top_range = top_range
 
     def run_train(self):
         self.to(self.device)
@@ -332,9 +333,12 @@ class Trainer(UserBook2Vec):
 
         print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
         self._save_wight_vec()
-        acc = self._eval_analogy(
-            analogy_path=self.folder_path.parent / "analogy_task.csv", thereshold=self.cos_threshold
-        )
+        if self.eval_task == "analogy_tast":
+            acc = self._eval_analogy(
+                analogy_path=self.folder_path.parent / f"{self.eval_task}.csv",
+            )
+        else:
+            acc = self._eval_sim(sim_path=self.folder_path.parent / f"{self.eval_task}.csv")
         return acc
 
     def _save_wight_vec(self):
@@ -347,12 +351,10 @@ class Trainer(UserBook2Vec):
         )
         self.eval()
 
-    def _eval_analogy(self, analogy_path: Path, thereshold: float = 0.6):
+    def _eval_analogy(self, analogy_path: Path):
         analogy_df = pd.read_csv(analogy_path)
-
         total = len(analogy_df)
         correct = 0
-
         for _, row in analogy_df.iterrows():
             analogy_list = [row["A"], row["B"], row["C"], row["D"]]
             for analogy_title in analogy_list:
@@ -362,14 +364,34 @@ class Trainer(UserBook2Vec):
             vec_a = self.book_embeddings[self.book2id[analogy_list[0]]]
             vec_b = self.book_embeddings[self.book2id[analogy_list[1]]]
             vec_c = self.book_embeddings[self.book2id[analogy_list[2]]]
-            vec_d = self.book_embeddings[self.book2id[analogy_list[3]]]
+            # vec_d = self.book_embeddings[self.book2id[analogy_list[3]]]
 
             predic_vec = vec_b - vec_a + vec_c
 
-            sim = cosine_similarity(predic_vec.reshape(1, -1), vec_d.reshape(1, -1))
-            if sim > thereshold:
+            sims = cosine_similarity(predic_vec.reshape(1, -1), self.book_embeddings)[0]
+            a_idx = self.book2id[analogy_list[0]]
+            top_indices = [i for i in sims.argsort()[::-1] if i != a_idx][: self.top_range]
+
+            target_idx = self.book2id[analogy_list[3]]
+            top_titles = [self.id2book[i] for i in top_indices]
+            if target_idx in top_indices:
                 correct += 1
-            print(sim)
+            print(f"Top-{self.top_range} Predictions: {top_titles}")
         acc = correct / total if total > 0 else 0.0
-        print(f"Accuracy:{acc} based on threshold:{thereshold}")
+        print(f"Accuracy:{acc} based on top_range{self.top_range}")
+        return acc
+
+    def _eval_sim(self, sim_path: Path, threshold: float = 0.6):
+        sim_df = pd.read_csv(sim_path)
+        total = len(sim_df)
+        correct = 0
+        for _, row in sim_df.iterrows():
+            vec_a = self.book_embeddings[self.book2id[row["A"]]]
+            vec_b = self.book_embeddings[self.book2id[row["B"]]]
+            similality = cosine_similarity(vec_a.reshape(1, -1), vec_b.reshape(1, -1))
+            if similality > threshold:
+                correct += 1
+            print(similality)
+        acc = correct / total if total > 0 else 0.0
+        print(f"Accuracy:{acc} based on {threshold}")
         return acc

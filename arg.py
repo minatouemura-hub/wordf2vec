@@ -19,17 +19,20 @@ class Word2VecCongig:
     alpha_range: list = field(default_factory=lambda: [0.01, 0.1])  # 初期学習率
     size_range: list = field(default_factory=lambda: [100, 150])  # 埋め込みベクトルの次元
     # ==
-    # down_sampleの追加
+    # down_sampleは基本on
     down_sample: bool = True
     sample: float = 1e-4
+
+    # 1回分の学習用
     embedding_dim: int = 150
-    num_negatives: int = 15
+    num_negatives: int = 35
     batch_size: int = 124
-    epochs: int = 40
+    epochs: int = 45
     learning_rate: float = 0.01
     early_stop_threshold: float = 0.001
 
-    cos_threshold: float = 0.5
+    top_range: int = 100
+    task_name: str = "sim_task"
 
 
 @dataclass
@@ -47,6 +50,9 @@ def get_args() -> Dict[str, Any]:
     )
     parser.add_argument("--grid_search_flag", action="store_true")
 
+    parser.add_argument(
+        "--task_name", type=str, default="sim_task", choices=["analogy_task", "sim_task"]
+    )
     parser.add_argument("--how_dim_reduce", type=str, default="pca", choices=["pca", "mean"])
     parser.add_argument("--find_axis_pairs", type=int, default=5)
 
