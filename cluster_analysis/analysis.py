@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt  # noqa
 import numpy as np  # noqa
 import pandas as pd  # noqa
 import scipy.cluster.hierarchy as sch  # noqa
+import scipy.stats as stats
 import seaborn as sns  # noqa
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa
 from scipy.spatial.distance import euclidean  # noqa
@@ -20,17 +21,25 @@ from scipy.spatial.distance import squareform  # noqa
 from scipy.stats import gaussian_kde  # noqa
 from sklearn.cluster import KMeans  # noqa
 from sklearn.manifold import TSNE  # noqa
+from sklearn.manifold import MDS
+from sklearn.metrics import (
+    adjusted_rand_score,
+    label_ranking_average_precision_score,
+    normalized_mutual_info_score,
+)
+from sklearn.preprocessing import MultiLabelBinarizer
+from torch import nn
 from tqdm import tqdm  # noqa
 from tslearn.clustering import KernelKMeans, TimeSeriesKMeans  # noqa
 
 from gender_axis.projection import Project_On  # noqa
 from util.utils import foulier_decomp, plt_linear, resample_sequence  # noqa
-from word2vec.train import Trainer  # noqa
+from word2vec import Trainer  # noqa
 
 # 必要なライブラリのインポート
 
 
-class ClusterAnalysis(Project_On):
+class ClusterAnalysis(Project_On, nn.Module):
     def __init__(
         self,
         base_dir: Path,
@@ -52,6 +61,7 @@ class ClusterAnalysis(Project_On):
             projection_args=projection_args,
             word2vec_config=word2vec_config,
         )
+        self.weight_path = weight_path
         self.num_cluster = num_cluster
         self.num_samples = num_samples
         self.whole_args = whole_args
@@ -81,19 +91,19 @@ class ClusterAnalysis(Project_On):
 
         # --- k-means のクラスタラベルで可視化 ---
         plt.figure(figsize=(8, 6))
-        plt.scatter(
-            embeddings_2d[:, 0],
-            embeddings_2d[:, 1],
-            c=sample_labels,
-            cmap="tab20",
-            edgecolors="none",
-            s=15,
-            alpha=0.4,
-        )
+
+        # --- 各クラスタごとにプロット（凡例付き） ---
+        for cl in np.unique(sample_labels):
+            cluster_points = embeddings_2d[sample_labels == cl]
+            plt.scatter(
+                cluster_points[:, 0], cluster_points[:, 1], label=f"Cluster {cl}", s=15, alpha=0.2
+            )
+
         plt.axis("off")
+        plt.legend(title="Clusters", bbox_to_anchor=(1.05, 1), loc="upper left")
         FIG_PATH = self.base_dir / "plt" / "t-SNE_fig.png"
-        plt.savefig(FIG_PATH)
-        # plt.show()
+        plt.savefig(FIG_PATH, bbox_inches="tight", dpi=300)
+        plt.close()
 
     def cluster_distribution(self):
         # 2.1 K-means のクラスタラベル + 書籍タイトルの DataFrame
@@ -273,7 +283,7 @@ class ClusterAnalysis(Project_On):
         plt.savefig(fig_path, dpi=300, bbox_inches="tight")
         # plt.show()
 
-    def dtw_kmeans_users(self, max_clusters=5, plt_flag=True, gamma=0.01):
+    def dtw_kmeans_users(self, gamma=0.01):
         """
         各ユーザーの読書順に沿った projection_vec を時系列データとみなし、
         DTW距離を用いて TimeSeriesKMeans によるクラスタリングを実施します。
@@ -303,11 +313,11 @@ class ClusterAnalysis(Project_On):
 
         user_ids = list(user_series.keys())
         n_users = len(user_ids)
+        print(f"n_usersは{n_users}です")
         if n_users < 2:
             print("クラスタリングに十分なユーザーが存在しません。")
             return
         # --- (3) DTWと累積コスト行列の計算---
-        gc.collect()
         dtw_distances = np.zeros((n_users, n_users), dtype=np.float32)
         for i in tqdm(range(n_users), desc="DTW Processing...", leave=True):
             for j in tqdm(
@@ -324,11 +334,10 @@ class ClusterAnalysis(Project_On):
         # --- (4) クラスタリング (KernelKMeans: 事前計算済みDTW距離からカーネル行列を構築) ---
         dtw_kernel = np.exp(-gamma * (dtw_distances**2))
         kernel_km = KernelKMeans(n_clusters=5, kernel="precomputed", random_state=42)
+        cluster_labels = kernel_km.fit_predict(dtw_kernel[:, :, np.newaxis])
 
-        cluster_labels = kernel_km.fit_predict(dtw_kernel)
-
+        self.plot_dtw_mds(cluster_labels=cluster_labels, dtw_distances=dtw_kernel)
         self.plot_relative_gender_ratio_by_cluster(cluster_labels=cluster_labels, user_ids=user_ids)
-        plt_linear(labels=cluster_labels, data_gen=user_series, output_path=self.base_dir / "plt")
 
     def plot_relative_gender_ratio_by_cluster(self, cluster_labels, user_ids):
         """
@@ -366,3 +375,149 @@ class ClusterAnalysis(Project_On):
         fig_path.parent.mkdir(parents=True, exist_ok=True)
         plt.savefig(fig_path, dpi=300)
         plt.close()
+
+    def plot_dtw_mds(self, dtw_distances, cluster_labels):
+        """
+        DTW距離に基づくMDSでクラスタリング結果を可視化
+        """
+        mds = MDS(n_components=2, dissimilarity="precomputed", random_state=42)
+        coords = mds.fit_transform(dtw_distances)
+
+        plt.figure(figsize=(8, 6))
+        for cl in np.unique(cluster_labels):
+            ix = cluster_labels == cl
+            plt.scatter(coords[ix, 0], coords[ix, 1], label=f"Cluster {cl}", alpha=0.6, s=20)
+
+        plt.title("MDS projection of users (based on DTW distance)")
+        plt.xlabel("MDS-1")
+        plt.ylabel("MDS-2")
+        plt.legend()
+        plt.tight_layout()
+        path = self.base_dir / "plt" / "dtw_mds_plot.png"
+        plt.savefig(path, dpi=300)
+        plt.close()
+
+
+def evaluate_clustering_with_genre_sets(
+    vec_df: pd.DataFrame,
+    meta_df: pd.DataFrame,
+    id_col: str = "title",
+    genre_col: str = "genres",
+    n_clusters: int = 5,
+):
+    """
+    複数ジャンルを持つデータに対して、クラスタリング結果との一致度をマルチラベル評価する。
+
+    Parameters:
+    - vec_df: ベクトル表現（index=title）
+    - meta_df: ジャンル列（genres列）が含まれるメタ情報
+    - id_col: vec_df.index に対応するカラム名（例：title）
+    - genre_col: 'Action|Adventure|Sci-Fi' などの複数ジャンル列
+    - n_clusters: クラスタ数
+    """
+    print("\n▶️ マルチジャンルによるクラスタ評価を実行中...")
+
+    # --- クラスタリング ---
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    cluster_labels = kmeans.fit_predict(vec_df.values)
+
+    # --- 統合 ---
+    df = vec_df.reset_index().copy()
+    df["cluster"] = cluster_labels
+    df = df.merge(meta_df[[id_col, genre_col]], on=id_col)
+
+    # --- ジャンルをセットに変換 ---
+    df["genre_list"] = df[genre_col].apply(lambda x: x.split("|") if pd.notnull(x) else [])
+
+    # --- マルチラベルバイナリ化 ---
+    mlb = MultiLabelBinarizer()
+    Y = mlb.fit_transform(df["genre_list"])
+    genres = mlb.classes_
+
+    # --- クラスタごとのジャンル頻度を集計 ---
+    cluster_genre_dist = pd.DataFrame(0, index=range(n_clusters), columns=genres)
+    for cl in range(n_clusters):
+        labels = df[df["cluster"] == cl]["genre_list"]
+        counts = pd.Series([g for sub in labels for g in sub]).value_counts()
+        for g in counts.index:
+            cluster_genre_dist.loc[cl, g] = counts[g]
+
+    # 正規化（確率）
+    cluster_genre_dist_norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
+
+    # --- z-scoreで可視化 ---
+    zscore_df = cluster_genre_dist_norm.copy()
+    zscore_df = (zscore_df - zscore_df.mean()) / zscore_df.std()
+
+    plt.figure(figsize=(14, 6))
+    sns.heatmap(zscore_df, annot=True, fmt=".2f", cmap="RdBu_r", center=0)
+    plt.title("Cluster-wise Multi-Genre Distribution (z-score)")
+    plt.ylabel("Cluster")
+    plt.xlabel("Genre")
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+    # --- LRAP 評価の修正 --- #
+    # クラスタ -> ジャンル分布（正規化済）からスコアを予測値として使う
+    genre_scores = df["cluster"].map(cluster_genre_dist_norm.to_dict(orient="index"))
+    genre_score_matrix = (
+        pd.DataFrame(list(genre_scores), index=df.index)[mlb.classes_].fillna(0).values
+    )
+
+    # 正解ラベル: Y（shape: サンプル数 × ジャンル数）
+    # 予測スコア: genre_score_matrix（クラスタ→ジャンル確率）
+    lrap = label_ranking_average_precision_score(Y, genre_score_matrix)
+    print(f"✅ Label Ranking Average Precision (LRAP): {lrap:.4f}")
+
+    return cluster_genre_dist, lrap, cluster_labels
+
+
+def compare_cluster_entropy_by_gender(data_df, cluster_labels, id2book, save_dir, num_cluster):
+    """
+    各ユーザーのクラスタ分布のエントロピーを計算し、性別ごとに比較
+    """
+    print("▶️ 性別ごとのクラスタ分布エントロピーを比較中...")
+
+    # 書籍 → クラスタ辞書
+    book2cluster = {id2book[i]: cluster_labels[i] for i in range(len(cluster_labels))}
+
+    # ユーザーごとにクラスタを記録
+    entropies = []
+    for uid, group in data_df.groupby("userId"):
+        gender = group["gender"].iloc[0] if "gender" in group.columns else "Unknown"
+        titles = group["title"].dropna()
+        cluster_list = titles.map(book2cluster).dropna().astype(int).tolist()
+        if len(cluster_list) == 0:
+            continue
+        # クラスタ出現頻度
+        counts = pd.Series(cluster_list).value_counts().reindex(range(num_cluster), fill_value=0)
+        probs = counts / counts.sum()
+        entropy = stats.entropy(probs, base=2)  # 情報エントロピー
+        entropies.append({"userId": uid, "gender": gender, "entropy": entropy})
+
+    df_entropy = pd.DataFrame(entropies)
+
+    # ヒストグラム or ボックスプロットで表示
+    plt.figure(figsize=(8, 5))
+    sns.boxplot(data=df_entropy, x="gender", y="entropy")
+    plt.title("Cluster Distribution Entropy by Gender")
+    plt.ylabel("Entropy (bits)")
+    plt.xlabel("Gender")
+    plt.tight_layout()
+
+    fig_path = save_dir / "plt" / "gender_cluster_entropy.png"
+    fig_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(fig_path, dpi=300)
+    plt.close()
+
+    # 統計比較も（オプション）
+    try:
+        m_vals = df_entropy[df_entropy["gender"] == "M"]["entropy"]
+        f_vals = df_entropy[df_entropy["gender"] == "F"]["entropy"]
+        stat, p = stats.ttest_ind(m_vals, f_vals, equal_var=False)
+        print(
+            f"✅ 平均エントロピー 男性={m_vals.mean():.3f}, 女性={f_vals.mean():.3f}, p値={p:.4f}"
+        )
+    except Exception:
+        print("⚠️ t検定失敗（データ不足の可能性）")

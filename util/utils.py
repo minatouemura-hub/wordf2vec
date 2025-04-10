@@ -28,22 +28,33 @@ def resample_sequence(seq, target_length):
     return np.interp(new_indices, np.arange(original_length), seq)
 
 
-def plt_linear(labels, data_gen: dict, output_path: Path):
-    n_clusters = len(np.unique(labels))
+def plt_linear(labels, data_gen: dict, output_path: Path, target_len: int = 30):
+    # --- 対象ユーザーを target_len 以上にフィルタ ---
+    valid_user_ids = [uid for uid, seq in data_gen.items() if len(seq) >= target_len]
+
+    # 対象ユーザーのインデックスとラベルだけ残す
+    user_id_list = list(data_gen.keys())
+    user_id_to_index = {uid: i for i, uid in enumerate(user_id_list)}
+    valid_indices = [user_id_to_index[uid] for uid in valid_user_ids]
+
+    labels = np.array(labels)
+    filtered_labels = labels[valid_indices]
+
+    # フィルタ後の data_gen を作成
+    filtered_data_gen = {uid: data_gen[uid] for uid in valid_user_ids}
+
+    n_clusters = len(np.unique(filtered_labels))
     n_rows = int(np.ceil(n_clusters / 2))
 
     fig = plt.figure(figsize=(14, 10))
     gs = fig.add_gridspec(n_rows + 1, 2, height_ratios=[1] * n_rows + [0.5])
 
-    dominant_freqs = []
-    target_len = 128
-
     for cl in range(n_clusters):
         row, col = divmod(cl, 2)
         ax = fig.add_subplot(gs[row, col])
-        cluster_indices = np.where(labels == cl)[0]
-        user_ids = list(data_gen.keys())
-        cluster_data = [data_gen[user_ids[i]] for i in cluster_indices]
+        cluster_indices = np.where(filtered_labels == cl)[0]
+        filtered_user_ids = list(filtered_data_gen.keys())
+        cluster_data = [filtered_data_gen[filtered_user_ids[i]] for i in cluster_indices]
 
         # リサンプルして長さを統一
         cluster_data_resampled = np.array(
@@ -65,12 +76,6 @@ def plt_linear(labels, data_gen: dict, output_path: Path):
     # --- 余った subplot 埋める ---
     for i in range(n_clusters, n_rows * 2):
         fig.add_subplot(gs[i // 2, i % 2]).axis("off")
-
-    # --- 周波数分布の仮プロット（未使用なら空プロットに） ---
-    df_freqs = pd.DataFrame(dominant_freqs or [(0, 0)], columns=["cluster", "dominant_freq"])
-    ax_box = fig.add_subplot(gs[-1, :])
-    sns.boxplot(data=df_freqs, x="cluster", y="dominant_freq", ax=ax_box)
-    ax_box.set_title("Dominant Frequencies per Cluster")
 
     fig.suptitle("DTW distance K-means Clustering + DTW Barycenter Visualization", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])

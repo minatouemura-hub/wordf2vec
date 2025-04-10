@@ -1,4 +1,4 @@
-import argparse
+import argparse  # noqa
 import csv
 import os
 from itertools import product
@@ -14,7 +14,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
 
-from word2vec.train import BookDataset, Trainer
+from word2vec import BookDataset, Trainer
 
 
 class Project_On(Trainer):
@@ -28,18 +28,23 @@ class Project_On(Trainer):
         word2vec_config,
         top_k=10,
     ):
-
         self.base_dir = base_dir
         self.top_k = top_k
         self.projection_args = projection_args
         down_sample = word2vec_config.down_sample
         sample = word2vec_config.sample
-        dataset = BookDataset(folder_path, down_sample=down_sample, sample=sample)
-        dataset.execute()
-
+        min_user_cnt = word2vec_config.min_user_cnt
+        dataset = BookDataset(
+            folder_path, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
+        )
+        dataset.preprocess()
+        self.id2book = dataset.id2book
+        self.book2id = dataset.book2id
+        self.data_gen = dataset.data_gen
         if os.path.isfile(weight_path) and not whole_args.retrain:
-            self._read_weight_vec(device="cpu")
-            self.book_embeddings = self.book_embed.weight.data.cpu().numpy()
+            trainer = Trainer(folder_path, weight_path, dataset=dataset)
+            trainer._read_weight_vec(device="cpu", weight_path=weight_path)
+            self.book_embeddings = trainer.book_embed.weight.data.cpu().numpy()
         else:
             if whole_args.grid_search_flag:
                 max_acc = -1
@@ -50,7 +55,7 @@ class Project_On(Trainer):
                 for dim, neg, lr in tqdm(
                     product(embedding_dims, num_negatives, learning_rates),
                     desc="Grid Search Processing",
-                    total=2 * 2 * 2,
+                    total=len(embedding_dims) * len(num_negatives) * len(learning_rates),
                 ):
                     Trainer.__init__(
                         self,
@@ -66,7 +71,6 @@ class Project_On(Trainer):
                     acc = self.run_train()
                     if acc > max_acc:
                         hyparams.append([dim, neg, lr])
-                quit()
             else:
                 Trainer.__init__(
                     self,
@@ -78,6 +82,7 @@ class Project_On(Trainer):
                     learning_rate=word2vec_config.learning_rate,
                     batch_size=word2vec_config.batch_size,
                     epochs=word2vec_config.epochs,
+                    scheduler_factor=word2vec_config.scheduler_factor,
                     early_stop_threshold=word2vec_config.early_stop_threshold,
                     top_range=word2vec_config.top_range,
                     eval_task=word2vec_config.task_name,
@@ -128,8 +133,8 @@ class Project_On(Trainer):
     def find_gender_axis(
         self,  # 全体で使用するペア数（seed ペア含む）
         n_neighbors: int = 20,  # 各書籍について取得する近傍数（自身を含むので実質10近傍）
-        male_book: str = "10億円を捨てた男の仕事術",
-        female_book: str = "女子の働き方 男性社会を自由に歩く「自分中心」の仕事術",
+        male_book: str = "7つの習慣-成功には原則があった",
+        female_book: str = "片づけられない女のための こんどこそ! 片づける技術",
     ):
         # 1. seed ペアの取得
         male_fav_bookid = self.book2id[male_book]
@@ -210,13 +215,11 @@ class Project_On(Trainer):
     def _eval_axis(
         self,
         target_axis,
-        male_book: str = "忙しいパパでもできる! 子育てなんとかなるブック (Nanaブックス)",
-        female_book: str = "ママも子どもも悪くない!しからずにすむ子育てのヒント",
+        male_book: str = "王様の速読術",
+        female_book: str = "左岸",
     ):
         another_axis = self.find_gender_axis(male_book=male_book, female_book=female_book)
         r, p_value = pearsonr(target_axis, another_axis)
         print("\n==社会軸のロバスト性検証==")
         print(f"ピアソン相関係数{r:.3f}")
         print(f"p値：{p_value:.3e}")
-        if r < 0.3:
-            quit()

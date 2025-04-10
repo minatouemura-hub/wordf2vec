@@ -6,6 +6,7 @@ from typing import Any, Dict
 # == DataClass ==
 @dataclass
 class WholeConfig:
+    dataset: str = "Movie"
     retrain: bool = True
     recompute_axis: bool = True  # 社会軸の再計算
     grid_search_flag: bool = True
@@ -15,10 +16,11 @@ class WholeConfig:
 class Word2VecCongig:
     # sample_range: list = [1e-3, 1e-4]  # 高頻度のダウンサンプリング
     # == grid_search用 ==
-    negative_range: list = field(default_factory=lambda: [10, 35])  # negative sampling
+    negative_range: list = field(default_factory=lambda: [35, 40])  # negative sampling
     alpha_range: list = field(default_factory=lambda: [0.01, 0.1])  # 初期学習率
     size_range: list = field(default_factory=lambda: [100, 150])  # 埋め込みベクトルの次元
     # ==
+
     # down_sampleは基本on
     down_sample: bool = True
     sample: float = 1e-4
@@ -27,9 +29,13 @@ class Word2VecCongig:
     embedding_dim: int = 150
     num_negatives: int = 35
     batch_size: int = 124
-    epochs: int = 45
+    epochs: int = 10
     learning_rate: float = 0.01
-    early_stop_threshold: float = 0.001
+    scheduler_factor: float = 0.1
+    early_stop_threshold: float = 0.05
+    min_user_cnt: int = (
+        1  # 1000ユーザーなら2000冊くらいからanalogy_taskを解けるようになる．13万冊を扱うなら...7万人くらいのデータ
+    )
 
     top_range: int = 100
     task_name: str = "sim_task"
@@ -44,6 +50,7 @@ class SocialAxisConfig:
 def get_args() -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description="word2vecf")
 
+    parser.add_argument("--dataset", type=str, default="Movie", choices=["Book", "Movie"])
     parser.add_argument("--retrain", action="store_true", help="Retraining word2vec flag")
     parser.add_argument(
         "--recompute_axis", action="store_true", help="Recompute social dimention flag"
