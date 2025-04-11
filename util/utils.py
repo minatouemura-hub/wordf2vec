@@ -1,110 +1,257 @@
-from pathlib import Path
+import argparse  # noqa
+import os  # noqa
+import sys  # noqa
+from collections import Counter, defaultdict
 
 import matplotlib.pyplot as plt
-import numpy as np
+import networkx as nx
 import pandas as pd  # noqa
-import seaborn as sns  # noqa
-from scipy.spatial.distance import cosine
-from tslearn.barycenters import dtw_barycenter_averaging
+from matplotlib import colormaps
+from matplotlib.patches import Patch
+from tqdm import tqdm
 
 
-def compute_dtw_accumulated_cost(x, y):
-    n = len(x)
-    m = len(y)
-    D = np.full((n + 1, m + 1), np.inf)
-    D[0, 0] = 0
-    for i in range(1, n + 1):
-        for j in range(1, m + 1):
-            cost = abs(x[i - 1] - y[j - 1])
-            D[i, j] = cost + min(D[i - 1, j], D[i, j - 1], D[i - 1, j - 1])
-    acc_cost = D[1:, 1:]
-    return acc_cost, acc_cost[-1, -1]
+def compute_echo_chamber_score(G, item_cluster_labels, target_cluster_id):
+    cluster_nodes = {n for n, cid in item_cluster_labels.items() if cid == target_cluster_id}
+    internal_edges = 0
+    external_edges = 0
+    for u, v in G.edges():
+        if u in cluster_nodes and v in cluster_nodes:
+            internal_edges += 1
+        elif u in cluster_nodes and v not in cluster_nodes:
+            external_edges += 1
+    total = internal_edges + external_edges
+    if total == 0:
+        return 0.0, internal_edges, external_edges
+    score = internal_edges / total
+    return score, internal_edges, external_edges
 
 
-def resample_sequence(seq, target_length):
-    original_length = len(seq)
-    if original_length == target_length:
-        return seq
-    new_indices = np.linspace(0, original_length - 1, target_length)
-    return np.interp(new_indices, np.arange(original_length), seq)
+def build_transition_network_by_item_cluster(
+    data_df, item_cluster_labels, save_dir, meta_df, min_weight=50
+):
+    cmap = colormaps.get_cmap("tab20")
+    title_to_movieId = dict(zip(meta_df["title"], meta_df["movieId"]))
 
+    cluster_to_titles = defaultdict(set)
+    for title, cluster_id in item_cluster_labels.items():
+        cluster_to_titles[cluster_id].add(title)
 
-def plt_linear(labels, data_gen: dict, output_path: Path, target_len: int = 30):
-    # --- 対象ユーザーを target_len 以上にフィルタ ---
-    valid_user_ids = [uid for uid, seq in data_gen.items() if len(seq) >= target_len]
+    echo_scores = []
 
-    # 対象ユーザーのインデックスとラベルだけ残す
-    user_id_list = list(data_gen.keys())
-    user_id_to_index = {uid: i for i, uid in enumerate(user_id_list)}
-    valid_indices = [user_id_to_index[uid] for uid in valid_user_ids]
+    for cluster_id, relevant_titles in tqdm(cluster_to_titles.items(), desc="ネットワーク構築中"):
+        edge_counter = defaultdict(int)
+        for user_id, group in data_df.groupby("userId"):
+            group = group.sort_values("timestamp")
+            actions = group["title"].tolist()
+            for i in range(len(actions) - 1):
+                src, dst = actions[i], actions[i + 1]
+                if src in relevant_titles or dst in relevant_titles:
+                    edge_counter[(src, dst)] += 1
 
-    labels = np.array(labels)
-    filtered_labels = labels[valid_indices]
+        G = nx.DiGraph()
+        for (src, dst), weight in edge_counter.items():
+            if weight >= min_weight:
+                G.add_edge(src, dst, weight=weight)
 
-    # フィルタ後の data_gen を作成
-    filtered_data_gen = {uid: data_gen[uid] for uid in valid_user_ids}
+        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+            continue
 
-    n_clusters = len(np.unique(filtered_labels))
-    n_rows = int(np.ceil(n_clusters / 2))
+        centrality = nx.out_degree_centrality(G)
+        node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
+        node_sizes = [500 + 3000 * centrality.get(n, 0) for n in G.nodes()]
 
-    fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(n_rows + 1, 2, height_ratios=[1] * n_rows + [0.5])
+        plt.figure(figsize=(12, 10))
+        pos = nx.spring_layout(G, seed=42, k=1.2)
+        weights = [G[u][v]["weight"] for u, v in G.edges()]
+        max_weight = max(weights)
+        edge_widths = [w * 0.1 for w in weights]
+        edge_alphas = [0.2 + 0.8 * (w / max_weight) for w in weights]
 
-    for cl in range(n_clusters):
-        row, col = divmod(cl, 2)
-        ax = fig.add_subplot(gs[row, col])
-        cluster_indices = np.where(filtered_labels == cl)[0]
-        filtered_user_ids = list(filtered_data_gen.keys())
-        cluster_data = [filtered_data_gen[filtered_user_ids[i]] for i in cluster_indices]
+        nx.draw_networkx_nodes(
+            G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.6, edgecolors="white"
+        )
+        for (u, v), width, alpha in zip(G.edges(), edge_widths, edge_alphas):
+            nx.draw_networkx_edges(
+                G, pos, edgelist=[(u, v)], arrows=True, width=width, edge_color="gray", alpha=alpha
+            )
 
-        # リサンプルして長さを統一
-        cluster_data_resampled = np.array(
-            [resample_sequence(series, target_len) for series in cluster_data]
+        label_nodes = {
+            n: str(title_to_movieId[n])
+            for n in G.nodes()
+            if (500 + 1500 * centrality.get(n, 0)) > 700 and n in title_to_movieId
+        }
+        nx.draw_networkx_labels(G, pos, labels=label_nodes, font_size=8, font_color="black")
+
+        unique_clusters = set(item_cluster_labels.get(n, -1) for n in G.nodes())
+        legend_elements = [
+            Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ {cid}")
+            for cid in sorted(unique_clusters)
+        ]
+        plt.legend(
+            handles=legend_elements,
+            title="ノードの所属クラスタ",
+            loc="upper right",
+            fontsize=8,
+            title_fontsize=9,
+            frameon=True,
         )
 
-        # 各系列を描画
-        for series in cluster_data_resampled:
-            ax.plot(series, color="black", alpha=0.1)
+        plt.title(f"アイテム遷移ネットワーク（クラスタ {cluster_id}）")
+        plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+        plt.savefig(
+            save_dir / "plt" / "network" / f"item_transition_network_cluster_{cluster_id}.png"
+        )
+        plt.close()
 
-        # DTWバリセンターをクラスタ中心とする
-        cluster_center = dtw_barycenter_averaging(cluster_data_resampled)
-        ax.plot(cluster_center, color="red", linewidth=2)
+        pd.DataFrame.from_dict(
+            centrality, orient="index", columns=["out_degree_centrality"]
+        ).to_csv(
+            save_dir
+            / "result"
+            / "network"
+            / f"item_transition_network_cluster_{cluster_id}_centrality.csv"
+        )
 
-        ax.set_xlim(0, target_len)
-        ax.set_ylabel("projection value")
-        ax.set_title(f"Cluster {cl}")
+        score, internal, external = compute_echo_chamber_score(G, item_cluster_labels, cluster_id)
+        echo_scores.append(
+            {
+                "cluster_id": cluster_id,
+                "echo_chamber_score": score,
+                "internal_edges": internal,
+                "external_edges": external,
+            }
+        )
 
-    # --- 余った subplot 埋める ---
-    for i in range(n_clusters, n_rows * 2):
-        fig.add_subplot(gs[i // 2, i % 2]).axis("off")
+    pd.DataFrame(echo_scores).to_csv(
+        save_dir / "result" / "network" / "echo_chamber_scores.csv", index=False
+    )
 
-    fig.suptitle("DTW distance K-means Clustering + DTW Barycenter Visualization", fontsize=16)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    output_path.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path / "dtw_cluster_plot.png")
+
+def build_transition_network_by_user_group(
+    data_df, group_filter, group_label, save_dir, meta_df, item_cluster_labels, min_weight=50
+):
+    """
+    ユーザー属性でフィルタリングしたデータから、各ユーザーの行動に基づいてネットワークを構築する関数です。
+    ノードの色は item のクラスタリング結果 (item_cluster_labels) を用い、さらに各ノード中心にその映画の平均評価を表示します。
+
+    Parameters:
+      data_df: ユーザー行動記録を含むDataFrame（rating列を含む前提）
+      group_filter: ユーザー属性フィルタ条件（例：(df["gender"]=="F") & (df["age"]>=20)）
+      group_label: グループの識別子（ファイル名に使用）
+      save_dir: 結果保存先（Pathオブジェクト）
+      meta_df: タイトルとmovieId等のメタ情報を含むDataFrame
+      item_cluster_labels: 各タイトルのクラスタリング結果（キー: title、値: クラスタID）
+      min_weight: エッジとして採用するための最低出現回数
+    """
+    cmap = colormaps.get_cmap("tab20")
+    # ユーザー属性でフィルタリング
+    filtered_df = data_df[group_filter].copy()
+    print(f"グループ {group_label} のユーザー数: {filtered_df['userId'].nunique()}")
+
+    # 各ユーザーの行動（タイトルの連続）からエッジをカウントする
+    edge_counter = defaultdict(int)
+    for user_id, group in filtered_df.groupby("userId"):
+        group = group.sort_values("timestamp")
+        actions = group["title"].tolist()
+        for i in range(len(actions) - 1):
+            src, dst = actions[i], actions[i + 1]
+            edge_counter[(src, dst)] += 1
+
+    # min_weight以上のエッジのみを抽出してグラフへ追加
+    G = nx.DiGraph()
+    for (src, dst), weight in edge_counter.items():
+        if weight >= min_weight:
+            G.add_edge(src, dst, weight=weight)
+
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+        print(f"グループ {group_label} のネットワークが構築できませんでした。")
+        return
+
+    # 出次数中心性を計算（ノードサイズの決定に利用）
+    centrality = nx.out_degree_centrality(G)
+
+    # アイテムクラスタのラベルを利用してノードの色を決定
+    node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
+    node_sizes = [500 + 3000 * centrality.get(n, 0) for n in G.nodes()]
+
+    plt.figure(figsize=(12, 10))
+    pos = nx.spring_layout(G, seed=42, k=1.2)
+    weights = [G[u][v]["weight"] for u, v in G.edges()]
+    max_weight = max(weights) if weights else 1
+    edge_widths = [w * 0.1 for w in weights]
+    edge_alphas = [0.2 + 0.8 * (w / max_weight) for w in weights]
+
+    nx.draw_networkx_nodes(
+        G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.6, edgecolors="white"
+    )
+    for (u, v), width, alpha in zip(G.edges(), edge_widths, edge_alphas):
+        nx.draw_networkx_edges(
+            G, pos, edgelist=[(u, v)], arrows=True, width=width, edge_color="gray", alpha=alpha
+        )
+
+    # meta情報（タイトル -> movieId）の辞書を作成
+    title_to_movieId = dict(zip(meta_df["title"], meta_df["movieId"]))  # noqa
+    # 各映画の平均評価を data_df から計算（rating列が存在する前提）
+    avg_ratings = data_df.groupby("title")["rating"].mean().to_dict()
+
+    # ノード中心に平均評価を描画
+    for n in G.nodes():
+        if n in avg_ratings:
+            plt.text(
+                pos[n][0],
+                pos[n][1],
+                f"{avg_ratings[n]:.1f}",
+                fontsize=8,
+                ha="center",
+                va="center",
+                color="black",
+            )
+
+    # アイテムのクラスタリング結果に基づく凡例を生成
+    unique_clusters = set(item_cluster_labels.get(n, -1) for n in G.nodes())
+    legend_elements = [
+        Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ {cid}")
+        for cid in sorted(unique_clusters)
+    ]
+    plt.legend(
+        handles=legend_elements,
+        title="アイテムの所属クラスタ",
+        loc="upper right",
+        fontsize=8,
+        title_fontsize=9,
+        frameon=True,
+    )
+
+    plt.title(f"ユーザー属性グループ別アイテム遷移ネットワーク（{group_label}）")
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
+    save_path = save_dir / "plt" / "network" / f"{group_label}_action_network.png"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(save_path)
     plt.close()
 
-
-def foulier_decomp(
-    cl: int,
-    cl_data: np.array,
-    dominant_freqs: list,
-):
-    for series in cl_data:
-        fft_vals = np.fft.fft(series - np.mean(series))
-        freqs = np.fft.fftfreq(len(series))
-        mag = np.abs(fft_vals[1 : len(freqs) // 2])
-        if mag.size == 0:
-            continue
-        dominant = freqs[1 : len(freqs) // 2][np.argmax(mag)]  # noqa
-        dominant_freqs.append((cl, dominant))
-    return dominant_freqs
+    # 中心性結果をCSVに保存
+    centrality_df = pd.DataFrame.from_dict(
+        centrality, orient="index", columns=["out_degree_centrality"]
+    )
+    centrality_path = (
+        save_dir / "result" / "network" / f"{group_label}_action_network_centrality.csv"
+    )
+    centrality_path.parent.mkdir(parents=True, exist_ok=True)
+    centrality_df.to_csv(centrality_path)
+    print(f"グループ {group_label} のネットワーク構築が完了しました。")
 
 
-def detect_change_cosine_threshold(vec_series: np.ndarray, threshold: float = 0.3) -> list:
-    change_points = []
-    for t in range(len(vec_series) - 1):
-        score = 1 - cosine(vec_series[t], vec_series[t + 1])
-        if score < threshold:  # 類似度が急低下＝関心が大きく変化
-            change_points.append(t)
-    return change_points
+def print_cluster_counts_and_ratios(item_cluster_labels: dict):
+    """
+    各クラスタに属する映画タイトルの数と全体に対する割合を表示する関数。
+
+    Parameters:
+      item_cluster_labels: {タイトル: クラスタID} の辞書
+    """
+    cluster_counts = Counter(item_cluster_labels.values())
+    total = sum(cluster_counts.values())
+    print("各クラスタのタイトル数と全体に対する割合:")
+    for cluster, count in sorted(cluster_counts.items()):
+        ratio = count / total * 100
+        print(f"  クラスタ {cluster}: {count} 件, {ratio:.1f}%")

@@ -5,37 +5,30 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent / "dtw_module"))
 import argparse  # noqa
 import gc  # noqa
+from math import ceil  # noqa
 
-import fastdtwmodule
+import fastdtwmodule  # noqa
 import japanize_matplotlib  # noqa
 import matplotlib.colors as mcolors  # noqa
 import matplotlib.pyplot as plt  # noqa
 import numpy as np  # noqa
 import pandas as pd  # noqa
-import ruptures as rpt
+import ruptures as rpt  # noqa
 import scipy.cluster.hierarchy as sch  # noqa
-import scipy.stats as stats
+import scipy.stats as stats  # noqa
 import seaborn as sns  # noqa
-from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa
-from scipy.spatial.distance import euclidean  # noqa
-from scipy.spatial.distance import squareform  # noqa
-from scipy.spatial.distance import cosine
+from kneed import KneeLocator  # noqa
 from scipy.stats import gaussian_kde  # noqa
 from sklearn.cluster import KMeans  # noqa
+from sklearn.manifold import MDS  # noqa
 from sklearn.manifold import TSNE  # noqa
-from sklearn.manifold import MDS
-from sklearn.metrics import (
-    adjusted_rand_score,
-    label_ranking_average_precision_score,
-    normalized_mutual_info_score,
-)
-from sklearn.preprocessing import MultiLabelBinarizer
-from torch import nn
+from sklearn.metrics import label_ranking_average_precision_score  # noqa
+from sklearn.preprocessing import MultiLabelBinarizer  # noqa
+from torch import nn  # noqa
 from tqdm import tqdm  # noqa
 from tslearn.clustering import KernelKMeans, TimeSeriesKMeans  # noqa
 
 from gender_axis.projection import Project_On  # noqa
-from util.utils import foulier_decomp, plt_linear, resample_sequence  # noqa
 from word2vec import Trainer  # noqa
 
 # 必要なライブラリのインポート
@@ -400,75 +393,177 @@ class ClusterAnalysis(Project_On, nn.Module):
         plt.close()
 
 
+def balanced_kmeans(X, n_clusters, max_iter=100, tol=1e-4, random_state=42):
+    """
+    バランス付き k-means を実装します。
+    各クラスタには最大 ceil(n_samples / n_clusters) 個のサンプルを割り当てるように制約します。
+
+    Parameters:
+      X : ndarray, shape (n_samples, n_features)
+          入力データ
+      n_clusters : int
+          クラスタ数
+      max_iter : int, default=100
+          最大反復回数
+      tol : float, default=1e-4
+          収束判定の閾値（各クラスタ中心の変位の最大値）
+      random_state : int, default=42
+          乱数シード
+
+    Returns:
+      labels : ndarray of int, shape (n_samples,)
+          各サンプルのクラスタ割り当て
+      centroids : ndarray, shape (n_clusters, n_features)
+          学習されたクラスタ中心
+    """
+    np.random.seed(random_state)
+    n_samples, n_features = X.shape
+    capacity = ceil(n_samples / n_clusters)  # 各クラスタの上限数
+    # 初期クラスタ中心はランダムに n_clusters 個のサンプルを選択
+    initial_indices = np.random.choice(n_samples, n_clusters, replace=False)
+    centroids = X[initial_indices].copy()
+    labels = np.zeros(n_samples, dtype=int)
+
+    for it in range(max_iter):
+        # 各サンプルと各クラスタ中心との距離を計算 (L2ノルム)
+        distances = np.linalg.norm(X[:, np.newaxis, :] - centroids, axis=2)
+        # 各サンプルについて、距離が小さい順にクラスタインデックスをソート
+        sorted_idx = np.argsort(distances, axis=1)
+
+        new_labels = -np.ones(n_samples, dtype=int)
+        cluster_sizes = {i: 0 for i in range(n_clusters)}
+        # サンプルごとに最小距離順に割り当て（まずは距離の最小値順に処理）
+        order = np.argsort(np.min(distances, axis=1))
+        for i in order:
+            for c in sorted_idx[i]:
+                if cluster_sizes[c] < capacity:
+                    new_labels[i] = c
+                    cluster_sizes[c] += 1
+                    break
+        # 万一未割当のサンプルがあれば、最小距離のクラスタに割り当てる
+        unassigned = np.where(new_labels == -1)[0]
+        if unassigned.size > 0:
+            for i in unassigned:
+                new_labels[i] = sorted_idx[i, 0]
+
+        # クラスタ中心の更新
+        new_centroids = np.zeros_like(centroids)
+        for c in range(n_clusters):
+            points = X[new_labels == c]
+            if len(points) > 0:
+                new_centroids[c] = points.mean(axis=0)
+            else:
+                new_centroids[c] = centroids[c]
+        shift = np.linalg.norm(new_centroids - centroids, axis=1).max()
+        if shift < tol:
+            break
+        centroids = new_centroids
+        labels = new_labels
+    return labels, centroids
+
+
+def compute_inertia(X, labels, centroids):
+    """
+    inertia = sum( || x_i - centroid(label_i) ||^2 ) を計算
+    """
+    inertia = 0.0
+    for c in range(centroids.shape[0]):
+        points = X[labels == c]
+        if len(points) > 0:
+            inertia += np.sum((points - centroids[c]) ** 2)
+    return inertia
+
+
 def evaluate_clustering_with_genre_sets(
     vec_df: pd.DataFrame,
     meta_df: pd.DataFrame,
     id_col: str = "title",
     genre_col: str = "genres",
-    n_clusters: int = 5,
-    save_dir: Path = ".",
+    n_clusters: int = 5,  # 初期値。Elbow 法で再推定
+    save_dir: Path = Path("."),
 ):
     """
     複数ジャンルを持つデータに対して、クラスタリング結果との一致度をマルチラベル評価する。
+    さらに Elbow 法によるクラスタ数のチューニング（バランス付き k-means を使用）を実施し、
+    最適なクラスタ数でクラスタリングを行う。
 
     Parameters:
-    - vec_df: ベクトル表現（index=title）
-    - meta_df: ジャンル列（genres列）が含まれるメタ情報
-    - id_col: vec_df.index に対応するカラム名（例：title）
-    - genre_col: 'Action|Adventure|Sci-Fi' などの複数ジャンル列
-    - n_clusters: クラスタ数
+      vec_df: ベクトル表現（index=title）
+      meta_df: ジャンル列（genres列）が含まれるメタ情報
+      id_col: vec_df.index に対応するカラム名（例：title）
+      genre_col: 'Action|Adventure|Sci-Fi' などの複数ジャンル列
+      n_clusters: （初期値）クラスタ数。Elbow 法で再推定される。
+      save_dir: 結果の保存先
+
+    Returns:
+      cluster_genre_dist: 各クラスタのジャンル頻度（絶対値）
+      lrap: Label Ranking Average Precision
+      cluster_labels: 最適なクラスタ数によるクラスタリングのラベル配列
+      optimal_k: 推定された最適クラスタ数
     """
     print("\n▶️ マルチジャンルによるクラスタ評価を実行中...")
 
-    # --- クラスタリング ---
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
-    cluster_labels = kmeans.fit_predict(vec_df.values)
+    X = vec_df.values
+    inertia_list = []
+    cluster_range = list(range(10, 51))
+    for k in cluster_range:
+        # balanced_kmeans によりクラスタリング
+        labels_temp, centroids_temp = balanced_kmeans(X, k, random_state=42)
+        inertia = compute_inertia(X, labels_temp, centroids_temp)
+        inertia_list.append(inertia)
 
-    # --- 統合 ---
+    kl = KneeLocator(cluster_range, inertia_list, curve="convex", direction="decreasing")
+    optimal_k = kl.knee if kl.knee is not None else n_clusters
+    print(f"推定された最適クラスタ数: {optimal_k}")
+
+    # 最適なクラスタ数を用いてバランス付き k-means を実行
+    cluster_labels, centroids = balanced_kmeans(X, optimal_k, random_state=42)
+
+    # 統合処理
     df = vec_df.reset_index().copy()
     df["cluster"] = cluster_labels
     df = df.merge(meta_df[[id_col, genre_col]], on=id_col)
 
-    # --- ジャンルをセットに変換 ---
+    # ジャンルリストに変換
     df["genre_list"] = df[genre_col].apply(lambda x: x.split("|") if pd.notnull(x) else [])
 
-    # --- マルチラベルバイナリ化 ---
+    # マルチラベルバイナリ
+
     mlb = MultiLabelBinarizer()
     Y = mlb.fit_transform(df["genre_list"])
     genres = mlb.classes_
 
-    # --- クラスタごとのジャンル頻度を集計 ---
-    cluster_genre_dist = pd.DataFrame(0, index=range(n_clusters), columns=genres)
-    for cl in range(n_clusters):
-        labels = df[df["cluster"] == cl]["genre_list"]
-        counts = pd.Series([g for sub in labels for g in sub]).value_counts()
+    # クラスタごとのジャンル頻度の集計
+    cluster_genre_dist = pd.DataFrame(0, index=range(optimal_k), columns=genres)
+    for cl in range(optimal_k):
+        labels_list = df[df["cluster"] == cl]["genre_list"]
+        counts = pd.Series([g for sub in labels_list for g in sub]).value_counts()
         for g in counts.index:
             cluster_genre_dist.loc[cl, g] = counts[g]
 
     # 正規化（確率）
     cluster_genre_dist_norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
 
-    # --- z-scoreで可視化 ---
-    zscore_df = cluster_genre_dist_norm.copy()
-    zscore_df = (zscore_df - zscore_df.mean()) / zscore_df.std()
+    # z-scoreでの可視化
+    import seaborn as sns
 
     plt.figure(figsize=(14, 6))
+    zscore_df = (
+        cluster_genre_dist_norm - cluster_genre_dist_norm.mean()
+    ) / cluster_genre_dist_norm.std()
     sns.heatmap(zscore_df, annot=True, fmt=".2f", cmap="RdBu_r", center=0)
     plt.title("Cluster-wise Multi-Genre Distribution (z-score)")
     plt.ylabel("Cluster")
     plt.xlabel("Genre")
     plt.tight_layout()
-    plt.savefig(save_dir / "plt" / "Eval_Item2vec")
+    plt.savefig(save_dir / "plt" / "cluster_genre_zscore.png")
     plt.close()
-    # --- LRAP 評価の修正 --- #
-    # クラスタ -> ジャンル分布（正規化済）からスコアを予測値として使う
+
     genre_scores = df["cluster"].map(cluster_genre_dist_norm.to_dict(orient="index"))
     genre_score_matrix = (
         pd.DataFrame(list(genre_scores), index=df.index)[mlb.classes_].fillna(0).values
     )
 
-    # 正解ラベル: Y（shape: サンプル数 × ジャンル数）
-    # 予測スコア: genre_score_matrix（クラスタ→ジャンル確率）
     lrap = label_ranking_average_precision_score(Y, genre_score_matrix)
     print(f"✅ Label Ranking Average Precision (LRAP): {lrap:.4f}")
 
