@@ -2,8 +2,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
-import seaborn as sns
+import pandas as pd  # noqa
+import seaborn as sns  # noqa
+from scipy.spatial.distance import cosine
 from tslearn.barycenters import dtw_barycenter_averaging
 
 
@@ -98,3 +99,12 @@ def foulier_decomp(
         dominant = freqs[1 : len(freqs) // 2][np.argmax(mag)]  # noqa
         dominant_freqs.append((cl, dominant))
     return dominant_freqs
+
+
+def detect_change_cosine_threshold(vec_series: np.ndarray, threshold: float = 0.3) -> list:
+    change_points = []
+    for t in range(len(vec_series) - 1):
+        score = 1 - cosine(vec_series[t], vec_series[t + 1])
+        if score < threshold:  # 類似度が急低下＝関心が大きく変化
+            change_points.append(t)
+    return change_points

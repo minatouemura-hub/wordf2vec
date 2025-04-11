@@ -12,12 +12,14 @@ import matplotlib.colors as mcolors  # noqa
 import matplotlib.pyplot as plt  # noqa
 import numpy as np  # noqa
 import pandas as pd  # noqa
+import ruptures as rpt
 import scipy.cluster.hierarchy as sch  # noqa
 import scipy.stats as stats
 import seaborn as sns  # noqa
 from scipy.cluster.hierarchy import dendrogram, fcluster, linkage  # noqa
 from scipy.spatial.distance import euclidean  # noqa
 from scipy.spatial.distance import squareform  # noqa
+from scipy.spatial.distance import cosine
 from scipy.stats import gaussian_kde  # noqa
 from sklearn.cluster import KMeans  # noqa
 from sklearn.manifold import TSNE  # noqa
@@ -404,6 +406,7 @@ def evaluate_clustering_with_genre_sets(
     id_col: str = "title",
     genre_col: str = "genres",
     n_clusters: int = 5,
+    save_dir: Path = ".",
 ):
     """
     複数ジャンルを持つデータに対して、クラスタリング結果との一致度をマルチラベル評価する。
@@ -418,7 +421,7 @@ def evaluate_clustering_with_genre_sets(
     print("\n▶️ マルチジャンルによるクラスタ評価を実行中...")
 
     # --- クラスタリング ---
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
     cluster_labels = kmeans.fit_predict(vec_df.values)
 
     # --- 統合 ---
@@ -455,9 +458,8 @@ def evaluate_clustering_with_genre_sets(
     plt.ylabel("Cluster")
     plt.xlabel("Genre")
     plt.tight_layout()
-    plt.show()
+    plt.savefig(save_dir / "plt" / "Eval_Item2vec")
     plt.close()
-
     # --- LRAP 評価の修正 --- #
     # クラスタ -> ジャンル分布（正規化済）からスコアを予測値として使う
     genre_scores = df["cluster"].map(cluster_genre_dist_norm.to_dict(orient="index"))
@@ -521,3 +523,11 @@ def compare_cluster_entropy_by_gender(data_df, cluster_labels, id2book, save_dir
         )
     except Exception:
         print("⚠️ t検定失敗（データ不足の可能性）")
+
+
+def detect_user_change_points(vec_series: np.ndarray, pen: int = 5) -> list:
+    """vec_series: shape (T, D)"""
+    if vec_series.shape[0] < 3:
+        return []  # 長さが短すぎて変化点検出不能
+    model = rpt.Pelt(model="rbf").fit(vec_series)
+    return model.predict(pen=pen)[:-1]  # 最後の点は除く
