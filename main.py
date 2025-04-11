@@ -12,12 +12,11 @@ import pandas as pd  # noqa
 import torch
 from matplotlib import colormaps
 from matplotlib.patches import Patch
-from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 from arg import get_args, parse_config
+from cluster_analysis.analysis import compare_cluster_entropy_by_gender  # noqa
 from cluster_analysis.analysis import (
-    compare_cluster_entropy_by_gender,
     detect_user_change_points,
     evaluate_clustering_with_genre_sets,
 )
