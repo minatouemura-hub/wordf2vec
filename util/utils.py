@@ -2,13 +2,19 @@ import argparse  # noqa
 import os  # noqa
 import sys  # noqa
 from collections import Counter, defaultdict
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 import pandas as pd  # noqa
 from matplotlib import colormaps
 from matplotlib.patches import Patch
+from networkx.algorithms.community import greedy_modularity_communities, modularity
+from sklearn.manifold import TSNE
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+from umap import UMAP  # noqa
 
 
 def compute_echo_chamber_score(G, item_cluster_labels, target_cluster_id):
@@ -99,9 +105,9 @@ def build_transition_network_by_item_cluster(
 
         plt.title(f"アイテム遷移ネットワーク（クラスタ {cluster_id}）")
         plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
-        plt.savefig(
-            save_dir / "plt" / "network" / f"item_transition_network_cluster_{cluster_id}.png"
-        )
+        plt_path = save_dir / "plt" / "network" / "item_network"
+        os.makedirs(plt_path, exist_ok=True)
+        plt.savefig(plt_path / f"item_transition_network_cluster_{cluster_id}.png")
         plt.close()
 
         pd.DataFrame.from_dict(
@@ -129,25 +135,22 @@ def build_transition_network_by_item_cluster(
 
 
 def build_transition_network_by_user_group(
-    data_df, group_filter, group_label, save_dir, meta_df, item_cluster_labels, min_weight=50
+    data_df,
+    group_filter,
+    group_label,
+    save_dir,
+    meta_df,
+    item_cluster_labels,
+    base_weight,
+    total_users,
 ):
-    """
-    ユーザー属性でフィルタリングしたデータから、各ユーザーの行動に基づいてネットワークを構築する関数です。
-    ノードの色は item のクラスタリング結果 (item_cluster_labels) を用い、さらに各ノード中心にその映画の平均評価を表示します。
-
-    Parameters:
-      data_df: ユーザー行動記録を含むDataFrame（rating列を含む前提）
-      group_filter: ユーザー属性フィルタ条件（例：(df["gender"]=="F") & (df["age"]>=20)）
-      group_label: グループの識別子（ファイル名に使用）
-      save_dir: 結果保存先（Pathオブジェクト）
-      meta_df: タイトルとmovieId等のメタ情報を含むDataFrame
-      item_cluster_labels: 各タイトルのクラスタリング結果（キー: title、値: クラスタID）
-      min_weight: エッジとして採用するための最低出現回数
-    """
     cmap = colormaps.get_cmap("tab20")
     # ユーザー属性でフィルタリング
     filtered_df = data_df[group_filter].copy()
-    print(f"グループ {group_label} のユーザー数: {filtered_df['userId'].nunique()}")
+    filtered_user_num = int(filtered_df["userId"].nunique())
+    adjusted_weight = int((filtered_user_num / total_users) * base_weight)
+    adjusted_weight = adjusted_weight if adjusted_weight >= 1 else 1
+    print(f"グループ {group_label} のユーザー数: {filtered_user_num}")
 
     # 各ユーザーの行動（タイトルの連続）からエッジをカウントする
     edge_counter = defaultdict(int)
@@ -158,20 +161,24 @@ def build_transition_network_by_user_group(
             src, dst = actions[i], actions[i + 1]
             edge_counter[(src, dst)] += 1
 
-    # min_weight以上のエッジのみを抽出してグラフへ追加
+    # adjusted_weight以上のエッジのみを抽出してグラフへ追加
     G = nx.DiGraph()
     for (src, dst), weight in edge_counter.items():
-        if weight >= min_weight:
+        if weight >= adjusted_weight:
             G.add_edge(src, dst, weight=weight)
 
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         print(f"グループ {group_label} のネットワークが構築できませんでした。")
         return
 
+    # モジュラリティ計算
+    undirected_G = G.to_undirected()
+    communities = greedy_modularity_communities(undirected_G)
+    mod_value = modularity(undirected_G, communities)
+    print(f"グループ {group_label} のモジュラリティ: {mod_value:.4f}")
+
     # 出次数中心性を計算（ノードサイズの決定に利用）
     centrality = nx.out_degree_centrality(G)
-
-    # アイテムクラスタのラベルを利用してノードの色を決定
     node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
     node_sizes = [500 + 3000 * centrality.get(n, 0) for n in G.nodes()]
 
@@ -208,7 +215,6 @@ def build_transition_network_by_user_group(
                 color="black",
             )
 
-    # アイテムのクラスタリング結果に基づく凡例を生成
     unique_clusters = set(item_cluster_labels.get(n, -1) for n in G.nodes())
     legend_elements = [
         Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ {cid}")
@@ -225,20 +231,20 @@ def build_transition_network_by_user_group(
 
     plt.title(f"ユーザー属性グループ別アイテム遷移ネットワーク（{group_label}）")
     plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
-    save_path = save_dir / "plt" / "network" / f"{group_label}_action_network.png"
+    save_path = save_dir / f"{group_label}_action_network.png"
     save_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(save_path)
     plt.close()
 
-    # 中心性結果をCSVに保存
-    centrality_df = pd.DataFrame.from_dict(
-        centrality, orient="index", columns=["out_degree_centrality"]
-    )
-    centrality_path = (
-        save_dir / "result" / "network" / f"{group_label}_action_network_centrality.csv"
-    )
-    centrality_path.parent.mkdir(parents=True, exist_ok=True)
-    centrality_df.to_csv(centrality_path)
+    # centrality_df = pd.DataFrame.from_dict(
+    #     centrality, orient="index", columns=["out_degree_centrality"]
+    # )
+    # centrality_path = (
+    #     save_dir / "result" / "network" / f"{group_label}_action_network_centrality.csv"
+    # )
+    # centrality_path.parent.mkdir(parents=True, exist_ok=True)
+    # centrality_df.to_csv(centrality_path)
+
     print(f"グループ {group_label} のネットワーク構築が完了しました。")
 
 
@@ -255,3 +261,64 @@ def print_cluster_counts_and_ratios(item_cluster_labels: dict):
     for cluster, count in sorted(cluster_counts.items()):
         ratio = count / total * 100
         print(f"  クラスタ {cluster}: {count} 件, {ratio:.1f}%")
+
+
+def plot_embeddings_tsne(embeddings, save_dir: Path, labels=None, label_name="embedding"):
+    """
+    任意の埋め込みベクトルをt-SNEで2次元に圧縮し、可視化する。
+
+    Parameters:
+        embeddings (ndarray): shape=(n_samples, dim)
+        save_dir (Path): 結果の画像保存先ディレクトリ
+        labels (array-like): 各サンプルのラベル（クラスタなど）。色分けに使用（任意）
+        label_name (str): プロットのタイトルやファイル名に使う埋め込みの名前
+    """
+    # 保存ディレクトリの作成
+    tsne_dir = save_dir / "plt"
+    tsne_dir.mkdir(parents=True, exist_ok=True)
+
+    # スケーリングによる密度調整（optionalだけど有効）
+    embeddings = StandardScaler().fit_transform(embeddings)
+
+    # t-SNE 設定（初期化方法・繰り返し回数・perplexity を明示）
+    tsne = TSNE(n_components=2, perplexity=30, random_state=42, init="pca", n_iter=2000)
+    emb_2d = tsne.fit_transform(embeddings)
+
+    # プロット
+    plt.figure(figsize=(8, 6))
+    if labels is not None:
+        labels = np.array(labels)
+        unique_labels = np.unique(labels)
+        for label in unique_labels:
+            idx = labels == label
+            plt.scatter(emb_2d[idx, 0], emb_2d[idx, 1], s=5, alpha=0.6)
+    else:
+        plt.scatter(emb_2d[:, 0], emb_2d[:, 1], s=5, alpha=0.6, color="blue")
+
+    plt.axis("off")
+    save_path = tsne_dir / f"{label_name}_tsne.png"
+    plt.savefig(save_path)
+    plt.close()
+
+    print(f"[INFO] t-SNEプロットを {save_path} に保存しました")
+
+
+def plot_with_umap(embeddings, labels=None, label_name="embedding", umap_dir=None):
+    reducer = UMAP(n_components=2, random_state=42)
+    emb_2d = reducer.fit_transform(embeddings)
+
+    plt.figure(figsize=(8, 6))
+    if labels is not None:
+        labels = np.array(labels)
+        for label in np.unique(labels):
+            idx = labels == label
+            plt.scatter(emb_2d[idx, 0], emb_2d[idx, 1], s=5, alpha=0.6)
+    else:
+        plt.scatter(emb_2d[:, 0], emb_2d[:, 1], s=5, alpha=0.6)
+
+    plt.axis("off")
+    umap_dir = umap_dir / "plt"
+    umap_dir.mkdir(parents=True, exist_ok=True)
+    save_path = umap_dir / f"{label_name}_umap.png"
+    plt.savefig(save_path)
+    plt.close()

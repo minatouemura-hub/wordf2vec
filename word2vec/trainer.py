@@ -9,6 +9,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR  # noqa
 from tqdm import tqdm
 
+from arg import TrainerConfig
 from word2vec.preprocessor import BookDataset
 
 from .model import UserBook2Vec
@@ -17,8 +18,8 @@ from .model import UserBook2Vec
 class Trainer(UserBook2Vec):
     def __init__(
         self,
-        folder_path: Path,
         weight_path: Path,
+        grid_search: bool = False,
         dataset: "BookDataset" = None,
         embedding_dim: int = 100,
         num_negatives: int = 5,
@@ -27,12 +28,9 @@ class Trainer(UserBook2Vec):
         learning_rate: float = 0.005,
         scheduler_factor: float = 0.2,
         early_stop_threshold: float = 0.001,
-        top_range: int = 5,
-        eval_task: str = "sim_task",
     ):
         UserBook2Vec.__init__(
             self,
-            folder_path=folder_path,
             dataset=dataset,
             embedding_dim=embedding_dim,
             batch_size=batch_size,
@@ -40,9 +38,12 @@ class Trainer(UserBook2Vec):
             epochs=epochs,
             learning_rate=learning_rate,
         )
+        self.trainer_config = TrainerConfig()
         self.dataset = dataset
-        self.eval_task = eval_task
+        self.analogy_path = weight_path.parent / "plt" / "movie_analogy.csv"
         self.weight_path = weight_path
+        self.grid_search = grid_search
+
         self.early_stop_threshold = early_stop_threshold
         self.embedding_dim = embedding_dim
         self.num_negatives = num_negatives
@@ -51,8 +52,6 @@ class Trainer(UserBook2Vec):
         self.scheduler_factor = scheduler_factor
         self.learning_rate = learning_rate
         self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-
-        self.top_range = top_range
 
     def train(self):
         self.to(self.device)
@@ -93,28 +92,28 @@ class Trainer(UserBook2Vec):
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
-            scheduler.step(total_loss)
-            print(f"Epoch {epoch+1}/{self.epochs} Loss: {total_loss/num_batches:.4f}")
-            if prev_loss is not None and abs(prev_loss - total_loss) < self.early_stop_threshold:
+            avg_loss = total_loss / num_batches
+            scheduler.step(avg_loss)
+            print(f"Epoch {epoch+1}/{self.epochs} Loss: {avg_loss:.4f}")
+            if prev_loss is not None and abs(prev_loss - avg_loss) < self.early_stop_threshold:
                 break
-            prev_loss = total_loss
+            prev_loss = avg_loss
 
         self.book_embeddings = self.book_embed.weight.data.cpu().numpy()
+        self.user_embeddings = self.user_embed.weight.data.cpu().numpy()
+
         id2book = self.dataset.id2book
         vec_df = pd.DataFrame(self.book_embeddings)
         vec_df["title"] = vec_df.index.map(id2book)
         self.vec_df = vec_df.set_index("title")
 
-        print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
-        self._save_wight_vec()
-
-        # if self.eval_task == "analogy_task":
-        #     acc = self._eval_analogy(
-        #         analogy_path=self.folder_path.parent / f"{self.eval_task}.csv",
-        #     )
-        # else:
-        #     acc = self._eval_sim(sim_path=self.folder_path.parent / f"{self.eval_task}.csv")
-        # return acc
+        if not self.grid_search:
+            print("\n=== 学習済み書籍埋め込み (shape) ===", self.book_embeddings.shape)
+            self._save_wight_vec()
+        else:
+            return self.eval_analogy(
+                analogy_path=self.dataset.analogy_path, top_range=self.trainer_config.t_range
+            )
 
     def _save_wight_vec(self):
         torch.save(self.state_dict(), self.weight_path)
@@ -127,60 +126,63 @@ class Trainer(UserBook2Vec):
         # ベクトルを DataFrame に格納（weight 再読込時）
         id2book = self.dataset.id2book
         self.book_embeddings = self.book_embed.weight.data.cpu().numpy()
+        self.user_embeddings = self.user_embed.weight.data.cpu().numpy()
         vec_df = pd.DataFrame(self.book_embeddings)
         vec_df["title"] = vec_df.index.map(id2book)
         self.vec_df = vec_df.set_index("title")
 
-    def _eval_analogy(self, analogy_path: Path):
+    def eval_analogy(
+        self,
+        analogy_path: Path,
+        top_range: int = 100,
+    ):
+        """
+        アナロジータスクを評価し、正解率を返す関数。
+
+        Parameters:
+            analogy_path (Path): アナロジータスクのCSVファイルパス
+            book2id (dict): 書籍タイトルからIDへの辞書
+            id2book (dict): IDから書籍タイトルへの辞書
+            book_embeddings (np.ndarray): 書籍ベクトルの埋め込み行列
+            top_range (int): 上位何件以内に正解が入っていれば正解とみなすか
+
+        Returns:
+            float: 正解率
+        """
         analogy_df = pd.read_csv(analogy_path)
-        total = len(analogy_df)
+        total = 0
         correct = 0
+
         for _, row in analogy_df.iterrows():
-            analogy_list = [row["A"], row["B"]]
-            for analogy_title in analogy_list:
-                if analogy_title not in self.book2id.keys():
-                    print(f"{analogy_title} not in book_dict")
-                    continue
+            A, B, C, D = row["A"], row["B"], row["C"], row["D (Answer)"]
 
-            vec_a = self.book_embeddings[self.book2id[analogy_list[0]]]
-            vec_b = self.book_embeddings[self.book2id[analogy_list[1]]]
-            # vec_c = self.book_embeddings[self.book2id[analogy_list[2]]]
-            # vec_d = self.book_embeddings[self.book2id[analogy_list[3]]]
-
-            # predic_vec = vec_b - vec_a + vec_c
-
-            sims = cosine_similarity(vec_a.reshape(1, -1), vec_b.reshape(1, -1))[0]
-            print(sims)
-            if sims >= 0.6:
-                correct += 1
-
-        #     a_idx = self.book2id[analogy_list[0]]
-        #     top_indices = [i for i in sims.argsort()[::-1] if i != a_idx][: self.top_range]
-
-        #     target_idx = self.book2id[analogy_list[3]]
-        #     top_titles = [self.id2book[i] for i in top_indices]
-        #     if target_idx in top_indices:
-        #         correct += 1
-        #     print(f"Top-{self.top_range} Predictions: {top_titles}")
-        acc = correct / total if total > 0 else 0.0
-        print(f"Accuracy:{acc} based on top_range{self.top_range}")
-        return acc
-
-    def _eval_sim(self, sim_path: Path, threshold: float = 0.6):
-        sim_df = pd.read_csv(sim_path)
-        total = len(sim_df)
-        correct = 0
-        for _, row in sim_df.iterrows():
-            if row["A"] not in self.book2id.keys() or row["B"] not in self.book2id.keys():
-                total -= 1
-
+            # すべてのタイトルが辞書に含まれていることを確認
+            if not all(title in self.dataset.book2id for title in [A, B, C, D]):
                 continue
-            vec_a = self.book_embeddings[self.book2id[row["A"]]]
-            vec_b = self.book_embeddings[self.book2id[row["B"]]]
-            similality = cosine_similarity(vec_a.reshape(1, -1), vec_b.reshape(1, -1))
-            if similality > threshold:
+
+            # アナロジーベクトル計算： vec_B - vec_A + vec_C
+            vec_a = self.book_embeddings[self.dataset.book2id[A]]
+            vec_b = self.book_embeddings[self.dataset.book2id[B]]
+            vec_c = self.book_embeddings[self.dataset.book2id[C]]
+            target_vec = vec_b - vec_a + vec_c
+
+            # 類似度の計算（内積で近い順にソート）
+            sims = cosine_similarity(target_vec.reshape(1, -1), self.book_embeddings)[0]
+            sorted_indices = np.argsort(sims)[::-1]
+
+            # D の index を取得し、上位 top_range に含まれているかを確認
+            d_idx = self.dataset.book2id[D]
+            top_indices = [
+                i
+                for i in sorted_indices
+                if i != self.dataset.book2id[A]
+                and i != self.dataset.book2id[B]
+                and i != self.dataset.book2id[C]
+            ][:top_range]
+
+            if d_idx in top_indices:
                 correct += 1
-            print(similality)
-        acc = correct / total if total > 0 else 0.0
-        print(f"Accuracy:{acc} based on {threshold}")
-        return acc
+            total += 1
+
+        accuracy = correct / total if total > 0 else 0.0
+        return accuracy

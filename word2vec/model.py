@@ -12,7 +12,6 @@ from word2vec.preprocessor import BookDataset
 class UserBook2Vec(nn.Module):
     def __init__(
         self,
-        folder_path: str,
         dataset: "BookDataset" = None,
         embedding_dim: int = 50,
         num_negatives: int = 5,

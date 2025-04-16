@@ -3,7 +3,7 @@ import os
 import random  # noqa
 import re
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +31,7 @@ class BookDataset(object):
         self._norm_titles()
         self.gender_counter()
         self.mapping()
+        self.make_analogy(base_dir=self.folder_path.parent.parent, n_samples=100)
 
     def _load_dataset(self):
         with open(
@@ -225,6 +226,62 @@ class BookDataset(object):
 
         print(f"フィルタ後の学習対象書籍数（ユニーク）: {len(self.book2id)}")
 
+    def make_analogy(self, base_dir: Path, n_samples: int = 100):
+        """
+        作者情報に基づいたアナロジータスクを作成し、CSVに保存する。
+
+        Parameters:
+            base_dir (Path): 出力先フォルダ
+            n_samples (int): 作成するアナロジータスク数（デフォルト100件）
+        """
+        author_to_titles = defaultdict(list)
+
+        for _, books in self.data_gen.items():
+            for book in books:
+                author = book.get("Author")
+                title = book.get("Title")
+                if author and title:
+                    author_to_titles[author].append(title)
+
+        # 有効なアナロジータスクを作れる作者を抽出
+        valid_authors = [a for a, titles in author_to_titles.items() if len(set(titles)) >= 4]
+
+        analogy_tasks = []
+        for _ in range(n_samples * 2):  # 多めに生成してフィルタ
+            if len(valid_authors) < 2:
+                break
+            author1, author2 = random.sample(valid_authors, 2)
+            titles1 = list(set(author_to_titles[author1]))
+            titles2 = list(set(author_to_titles[author2]))
+
+            if len(titles1) < 2 or len(titles2) < 2:
+                continue
+
+            A, B = random.sample(titles1, 2)
+            C, D = random.sample(titles2, 2)
+
+            analogy_tasks.append(
+                {
+                    "Author1": author1,
+                    "Author2": author2,
+                    "A": A,
+                    "B": B,
+                    "C": C,
+                    "D (Answer)": D,
+                    "Analogy": f"({A} : {B}) = ({C} : ?)",
+                }
+            )
+
+            if len(analogy_tasks) >= n_samples:
+                break
+
+        analogy_dir = base_dir / "analogy"
+        analogy_dir.mkdir(parents=True, exist_ok=True)
+        df_analogy = pd.DataFrame(analogy_tasks)
+        self.analogy_path = analogy_dir / "book_analogy.csv"
+        df_analogy.to_csv(self.analogy_path, index=False)
+        return df_analogy
+
 
 class MovieDataset(object):
     def __init__(
@@ -242,6 +299,7 @@ class MovieDataset(object):
     def preprocess(self):
         self._load_dataset()
         self.mapping()
+        self.make_analogy(base_dir=self.movie_dir.parent, n_samples=100)
 
     def _load_dataset(self):
         if not os.path.isdir(self.movie_dir):
@@ -326,3 +384,74 @@ class MovieDataset(object):
                 self.pairs.append((user_idx, book_idx))
 
         print(f"フィルタ後の映画数（ユニークタイトル）: {len(self.book2id)}")
+
+    def make_analogy(self, base_dir: Path, n_samples: int = 100):
+        """
+        ジャンルと年代の組み合わせに基づいたアナロジータスクを作成し、CSVに保存する。
+
+        Parameters:
+            base_dir (Path): CSV出力先のベースパス（.csvファイルを含むフォルダ）
+            n_samples (int): アナロジータスク数（デフォルト100件）
+        """
+
+        def extract_decade(title):
+            match = re.search(r"\((\d{4})\)$", title)
+            if match:
+                year = int(match.group(1))
+                return (year // 10) * 10
+            return None
+
+        contrasting_genre_pairs = [
+            (frozenset(["Comedy"]), frozenset(["Horror"])),
+            (frozenset(["Children's"]), frozenset(["Horror"])),
+            (frozenset(["Musical"]), frozenset(["Action"])),
+            (frozenset(["Crime"]), frozenset(["Animation"])),
+            (frozenset(["Romance"]), frozenset(["Action"])),
+            (frozenset(["Documentary"]), frozenset(["Fantasy"])),
+            (frozenset(["Drama"]), frozenset(["Sci-Fi"])),
+        ]
+
+        genre_decade_to_titles = defaultdict(list)
+        for _, row in self.data_gen.iterrows():
+            decade = extract_decade(row["title"])
+            if decade is None:
+                continue
+            genre_set = frozenset(row["genres"].split("|"))
+            genre_decade_to_titles[(genre_set, decade)].append(row["title"])
+
+        analogy_tasks = []
+
+        for genre1, genre2 in contrasting_genre_pairs:
+            for decade in range(1960, 2020, 10):
+                titles1 = genre_decade_to_titles.get((genre1, decade), [])
+                titles2 = genre_decade_to_titles.get((genre2, decade), [])
+                if len(titles1) < 3 or len(titles2) < 3:
+                    continue
+                for _ in range(3):
+                    A, B = random.sample(titles1, 2)
+                    C, D = random.sample(titles2, 2)
+                    analogy_tasks.append(
+                        {
+                            "Genre1": "|".join(sorted(genre1)),
+                            "Genre2": "|".join(sorted(genre2)),
+                            "Decade": f"{decade}s",
+                            "A": A,
+                            "B": B,
+                            "C": C,
+                            "D (Answer)": D,
+                            "Analogy": f"({A} : {B}) = ({C} : ?)",
+                        }
+                    )
+                    if len(analogy_tasks) >= n_samples:
+                        break
+                if len(analogy_tasks) >= n_samples:
+                    break
+            if len(analogy_tasks) >= n_samples:
+                break
+
+        analogy_dir = base_dir / "analogy"
+        analogy_dir.mkdir(parents=True, exist_ok=True)
+        df_analogy = pd.DataFrame(analogy_tasks[:n_samples])
+        self.analogy_path = analogy_dir / "movie_analogy.csv"
+        df_analogy.to_csv(self.analogy_path, index=False)
+        return df_analogy
