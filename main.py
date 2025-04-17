@@ -83,7 +83,7 @@ def build_user_graphs(data_df, sample_n=None, max_workers=8):
 
 
 def compute_graph_kernel_matrix(graphs):
-    gk = GraphKernel(kernel=["weisfeiler_lehman", "shortest_path"], normalize=True)
+    gk = GraphKernel(kernel=["VH"], normalize=True)
     return gk.fit_transform(graphs)
 
 

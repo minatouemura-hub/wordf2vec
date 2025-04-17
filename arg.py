@@ -55,7 +55,7 @@ class ClusterConfig:
 class NetworkConfig:
     item_weight: int = 50
     cluster_user_weight: int = 70
-    base_user_weight: int = 60
+    base_user_weight: int = 10
 
 
 def get_args() -> Dict[str, Any]:

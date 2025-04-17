@@ -35,7 +35,7 @@ def compute_echo_chamber_score(G, item_cluster_labels, target_cluster_id):
 
 
 def build_transition_network_by_item_cluster(
-    data_df, item_cluster_labels, save_dir, meta_df, min_weight=50
+    data_df, item_cluster_labels, save_dir, meta_df, min_weight=3
 ):
     cmap = colormaps.get_cmap("tab20")
     title_to_movieId = dict(zip(meta_df["title"], meta_df["movieId"]))
@@ -150,34 +150,30 @@ def build_transition_network_by_user_group(
     total_users: int,
     k_nn: int = 5,
     alpha: float = 0.7,
+    edge_weight_threshold: float = 1.0,  # 描画対象のエッジ重みの閾値
 ):
     """
-    ユーザー行動遷移グラフと「埋め込み距離」による KNN グラフを合成したハイブリッドネットワークを作成。
-
-    - alpha: 遷移重みと埋め込み類似度(1/距離)を混合する比率
-    - k_nn: 各ノードから近傍 k_nn 本の埋め込みエッジを張る
+    ユーザー行動遷移グラフと埋め込み類似度による KNN グラフを合成し、
+    可視化時には一定以上の重みを持つエッジのみを残す。
     """
     cmap = colormaps.get_cmap("tab20")
 
-    # 1) 埋め込み距離に基づく KNN グラフを先に構築
+    # 1) 埋め込み距離に基づく KNN グラフを構築
     titles = list(meta_df["title"])
-    # 全タイトルの距離行列（一度だけ計算すると高速）
     dist_mat = pairwise_distances(embeddings, metric="euclidean")
     G_emb = nx.DiGraph()
     for title in titles:
         i = title2idx.get(title)
         if i is None:
             continue
-        # 自分自身を除くソート
         neigh = np.argsort(dist_mat[i])[1 : k_nn + 1]
         for j in neigh:
             tgt = titles[j]
             d = dist_mat[i, j]
             if np.isfinite(d):
-                # 類似度として 1/d を重み付け
                 G_emb.add_edge(title, tgt, weight=1.0 / (d + 1e-6))
 
-    # 2) 元の「行動遷移グラフ」を構築
+    # 2) 行動遷移グラフを構築
     filtered_df = data_df[group_filter].copy()
     filtered_user_num = int(filtered_df["userId"].nunique())
     adjusted_w = max(int(filtered_user_num / total_users * base_weight), 1)
@@ -201,38 +197,52 @@ def build_transition_network_by_user_group(
         else:
             G.add_edge(u, v, weight=emb_w)
 
-    # 4) 描画・解析（以下は従来どおり）
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         print(f"グループ {group_label} のネットワークが構築できませんでした。")
         return
 
-    # モジュラリティ
+    # モジュラリティ（全体グラフで評価）
     ug = G.to_undirected()
     comms = greedy_modularity_communities(ug)
     mod_val = modularity(ug, comms)
     print(f"グループ {group_label} のモジュラリティ: {mod_val:.4f}")
 
-    # 入次数中心性
-    centrality = nx.in_degree_centrality(G)
-    node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
-    node_sizes = [200 + 5000 * centrality.get(n, 0) for n in G.nodes()]
+    # 可視化：閾値以上の重みを持つエッジのみ抽出
+    important_edges = [(u, v) for u, v in G.edges() if G[u][v]["weight"] >= edge_weight_threshold]
+    drawn_nodes = set([u for u, v in important_edges] + [v for u, v in important_edges])
 
+    if not drawn_nodes:
+        print(f"グループ {group_label} に表示可能なノードがありません。")
+        return
+
+    # 可視ノードに対応する中心性
+    centrality = nx.in_degree_centrality(G)
+    node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in drawn_nodes]
+    node_sizes = [200 + 5000 * centrality.get(n, 0) for n in drawn_nodes]
+
+    # レイアウト・描画
     plt.figure(figsize=(12, 10))
     pos = nx.kamada_kawai_layout(G)
-    weights = [G[u][v]["weight"] for u, v in G.edges()]
+    weights = [G[u][v]["weight"] for u, v in important_edges]
     max_w = max(weights) if weights else 1
     widths = [0.2 + 2.8 * (w / max_w) for w in weights]
 
     nx.draw_networkx_nodes(
-        G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.6, edgecolors="white"
+        G,
+        pos,
+        nodelist=drawn_nodes,
+        node_color=node_colors,
+        node_size=node_sizes,
+        alpha=0.6,
+        edgecolors="white",
     )
     nx.draw_networkx_edges(
-        G, pos, edgelist=list(G.edges()), width=widths, arrowstyle="->", arrowsize=8, alpha=0.4
+        G, pos, edgelist=important_edges, width=widths, arrowstyle="->", arrowsize=8, alpha=0.4
     )
 
     legend_elems = [
         Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ{cid}")
-        for cid in sorted(set(item_cluster_labels.get(n, -1) for n in G.nodes()))
+        for cid in sorted(set(item_cluster_labels.get(n, -1) for n in drawn_nodes))
     ]
     plt.legend(
         handles=legend_elems,
