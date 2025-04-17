@@ -1,10 +1,12 @@
 import argparse  # noqa
 import os  # noqa
+import random
 import sys  # noqa
 
 # 上記設定を行ったあとにnumpyやscipyなどをインポート
 import warnings
 from collections import Counter, defaultdict  # noqa
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict
 
@@ -46,20 +48,37 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-def build_user_graphs(data_df):
+def _build_single_user_graph(user_id, group):
+    edges = []
+    node_labels = {}
+    titles = group.sort_values("timestamp")["title"].tolist()
+    for u, v in zip(titles, titles[1:]):
+        edges.append((u, v))
+        node_labels[u] = u
+        node_labels[v] = v
+    if edges:
+        return user_id, Graph(edges, node_labels=node_labels)
+    return None
+
+
+def build_user_graphs(data_df, sample_n=None, max_workers=8):
+    grouped = list(data_df.groupby("userId"))
+
+    if sample_n is not None and sample_n < len(grouped):
+        grouped = random.sample(grouped, k=sample_n)
+
     user_graphs = []
     user_ids = []
-    for user_id, group in tqdm(data_df.groupby("userId"), desc="ユーザーグラフの構築中"):
-        edges = []
-        node_labels = {}
-        titles = group.sort_values("timestamp")["title"].tolist()
-        for idx, (u, v) in enumerate(zip(titles, titles[1:])):
-            edges.append((u, v))
-            node_labels[u] = u  # ラベルにタイトル名（またはユニークなID）を入れる
-            node_labels[v] = v
-        if edges:
-            user_graphs.append(Graph(edges, node_labels=node_labels))
-            user_ids.append(user_id)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_build_single_user_graph, uid, grp) for uid, grp in grouped]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="ユーザーグラフ構築中"):
+            result = future.result()
+            if result:
+                uid, graph = result
+                user_ids.append(uid)
+                user_graphs.append(graph)
+
     return user_graphs, user_ids
 
 
@@ -153,7 +172,7 @@ def main(args_dict: Dict[str, Any]):
     )
 
     # ==== Graph Kernel によるユーザークラスタリング ====
-    user_graphs, user_ids = build_user_graphs(dataloader.data_gen)
+    user_graphs, user_ids = build_user_graphs(dataloader.data_gen, sample_n=100, max_workers=4)
     K = compute_graph_kernel_matrix(user_graphs)
     user_cluster_labels = cluster_users_by_graph_kernel(K, n_clusters=10)
 
