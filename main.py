@@ -4,12 +4,17 @@ import sys  # noqa
 
 # 上記設定を行ったあとにnumpyやscipyなどをインポート
 import warnings
+from collections import Counter, defaultdict  # noqa
 from pathlib import Path
 from typing import Any, Dict
 
-import pandas as pd  # noqa
+import numpy as np  # noqa
+import pandas as pd  # Noqa; noqa
 import torch
-from sklearn.cluster import KMeans
+from grakel import Graph, GraphKernel
+from sklearn.cluster import KMeans, SpectralClustering
+from sklearn.metrics.pairwise import pairwise_distances  # noqa
+from tqdm import tqdm
 
 from arg import get_args, parse_config
 from cluster_analysis.analysis import Balanced_Kmeans  # noqa
@@ -41,14 +46,39 @@ warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 
+def build_user_graphs(data_df):
+    user_graphs = []
+    user_ids = []
+    for user_id, group in tqdm(data_df.groupby("userId"), desc="ユーザーグラフの構築中"):
+        edges = []
+        node_labels = {}
+        titles = group.sort_values("timestamp")["title"].tolist()
+        for idx, (u, v) in enumerate(zip(titles, titles[1:])):
+            edges.append((u, v))
+            node_labels[u] = u  # ラベルにタイトル名（またはユニークなID）を入れる
+            node_labels[v] = v
+        if edges:
+            user_graphs.append(Graph(edges, node_labels=node_labels))
+            user_ids.append(user_id)
+    return user_graphs, user_ids
+
+
+def compute_graph_kernel_matrix(graphs):
+    gk = GraphKernel(kernel=["weisfeiler_lehman", "shortest_path"], normalize=True)
+    return gk.fit_transform(graphs)
+
+
+def cluster_users_by_graph_kernel(K, n_clusters=10):
+    model = SpectralClustering(n_clusters=n_clusters, affinity="precomputed", random_state=42)
+    return model.fit_predict(K)
+
+
 def main(args_dict: Dict[str, Any]):
-    # 　0. ハイパーパラメータのロード
     whole_args, word2vec_config, network_config = parse_config(args_dict)
     down_sample = word2vec_config.down_sample
     sample = word2vec_config.sample
     min_user_cnt = word2vec_config.min_user_cnt
 
-    # 1. データの読み込み
     BASE_DIR = Path(__file__).resolve().parent
     if whole_args.dataset == "Book":
         DATA_PATH = BASE_DIR / "book_dataset" / "all_users_results.json"
@@ -56,27 +86,21 @@ def main(args_dict: Dict[str, Any]):
         if not os.path.isfile(DATA_PATH):
             run_scrape()
         dataloader = BookDataset(
-            folder_path=DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
+            DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
         )
     else:
         DATA_PATH = BASE_DIR / "ml-1m"
         WEIGHT_PATH = BASE_DIR / "weight_vec" / f"{whole_args.dataset}2vec_model.pth"
         dataloader = MovieDataset(
-            movie_dir=DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
+            DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
         )
     dataloader.preprocess()
 
-    # 2. word2vecのトレイナー読み込みと学習
     if whole_args.grid_search_flag:
-        searcher = OptunaSearch(
-            word2vec_config=word2vec_config,
-            weight_path=WEIGHT_PATH,
-            dataset=dataloader,
-        )
+        searcher = OptunaSearch(word2vec_config, WEIGHT_PATH, dataloader)
         best_param, _ = searcher.search()
-        # === best_param に基づき Trainer を再定義 ===
         trainer = Trainer(
-            weight_path=WEIGHT_PATH,
+            WEIGHT_PATH,
             dataset=dataloader,
             embedding_dim=best_param["embedding_dim"],
             num_negatives=best_param["num_negatives"],
@@ -85,11 +109,10 @@ def main(args_dict: Dict[str, Any]):
             epochs=word2vec_config.epochs,
             scheduler_factor=word2vec_config.scheduler_factor,
             early_stop_threshold=word2vec_config.early_stop_threshold,
-            grid_search=False,  # 本番学習なので grid_search フラグはオフ
         )
     else:
         trainer = Trainer(
-            weight_path=WEIGHT_PATH,
+            WEIGHT_PATH,
             dataset=dataloader,
             embedding_dim=word2vec_config.embedding_dim,
             num_negatives=word2vec_config.num_negatives,
@@ -98,88 +121,58 @@ def main(args_dict: Dict[str, Any]):
             epochs=word2vec_config.epochs,
             scheduler_factor=word2vec_config.scheduler_factor,
             early_stop_threshold=word2vec_config.early_stop_threshold,
-            grid_search=False,
         )
 
     if not os.path.isfile(WEIGHT_PATH) or whole_args.retrain:
         trainer.train()
     else:
         trainer._read_weight_vec(
-            device="mps" if torch.backends.mps.is_available() else "cpu", weight_path=WEIGHT_PATH
+            device="cuda" if torch.cuda.is_available() else "cpu", weight_path=WEIGHT_PATH
         )
 
-    # 3.行動(映画タイトル，本のタイトル)の特徴量を用いたクラスタリング
     vec_df = trainer.vec_df
     if whole_args.dataset == "Movie":
-        # メタデータの整形
         meta_df = dataloader.data_gen[["movieId", "title", "genres"]].drop_duplicates()
         meta_df["main_genre"] = meta_df["genres"].apply(lambda g: g.split("|")[0])
-
-        cluster_genre_dist, lrap, labels = evaluate_clustering_with_genre_sets(
-            vec_df,
-            meta_df,
-            id_col="title",
-            genre_col="genres",
-            save_dir=BASE_DIR,
+        _, _, labels = evaluate_clustering_with_genre_sets(
+            vec_df, meta_df, "title", "genres", BASE_DIR
         )
         item_cluster_labels = dict(zip(vec_df.index, labels))
-        print_cluster_counts_and_ratios(item_cluster_labels)
     else:
-        # 通常のクラスタリング（ジャンル評価なし）
         optimal_k = find_best_k_by_elbow(vec_df.values, max_k=20)
         kmeans = KMeans(n_clusters=optimal_k, n_init="auto", random_state=42)
         labels = kmeans.fit_predict(vec_df.values)
         item_cluster_labels = dict(zip(vec_df.index, labels))
-        print_cluster_counts_and_ratios(item_cluster_labels)
 
-    plot_embeddings_tsne(
-        embeddings=trainer.book_embeddings,
-        labels=labels,
-        label_name="artwork",
-        save_dir=BASE_DIR,
-    )
-    plot_with_umap(
-        embeddings=trainer.book_embeddings, labels=labels, label_name="artwork", umap_dir=BASE_DIR
-    )
+    print_cluster_counts_and_ratios(item_cluster_labels)
+    plot_embeddings_tsne(trainer.book_embeddings, BASE_DIR, labels, "artwork")
+    plot_with_umap(trainer.book_embeddings, labels, "artwork", BASE_DIR)
 
     build_transition_network_by_item_cluster(
-        data_df=dataloader.data_gen,
-        item_cluster_labels=item_cluster_labels,
-        save_dir=BASE_DIR,
-        meta_df=meta_df,
-        min_weight=network_config.item_weight,
+        dataloader.data_gen, item_cluster_labels, BASE_DIR, meta_df, network_config.item_weight
     )
 
-    # 4.word2vecの結果を用いたユーザーのクラスタリング
-    user_embeddings = trainer.user_embeddings
+    # ==== Graph Kernel によるユーザークラスタリング ====
+    user_graphs, user_ids = build_user_graphs(dataloader.data_gen)
+    K = compute_graph_kernel_matrix(user_graphs)
+    user_cluster_labels = cluster_users_by_graph_kernel(K, n_clusters=10)
+
     user_df = dataloader.data_gen[["userId", "gender"]].drop_duplicates()
-    assert user_embeddings.shape[0] == len(user_df), "ユーザー数が一致しません"
-
-    n_user_clusters = find_best_k_by_elbow(user_embeddings, max_k=20)
-    print(f"[INFO] Elbow法により選ばれたクラスタ数: {n_user_clusters}")
-
-    kmeans = KMeans(n_clusters=n_user_clusters, n_init="auto", random_state=42)
-    user_cluster_labels = kmeans.fit_predict(user_embeddings)
+    user_df = user_df[user_df["userId"].isin(user_ids)].copy()
     user_df["cluster"] = user_cluster_labels
 
-    plot_embeddings_tsne(
-        embeddings=trainer.user_embeddings,
-        labels=user_cluster_labels,
-        label_name="user",
-        save_dir=BASE_DIR,
-    )
-
-    # 5.  ユーザークラスタごとのネットワーク作成
+    # ==== ハイブリッドネットワーク作成 ====
     PLT_RESULT_DIR = BASE_DIR / "plt" / "network"
-    total_users = int(dataloader.data_gen["userId"].nunique())  # user_idに統一した方がええかも
+    total_users = dataloader.data_gen["userId"].nunique()
+    title2idx = {title: idx for idx, title in enumerate(vec_df.index)}
+
     cluster_groups = {
         f"user_cluster_{cid}": dataloader.data_gen["userId"].isin(
             user_df[user_df["cluster"] == cid]["userId"]
         )
-        for cid in range(n_user_clusters)
+        for cid in np.unique(user_cluster_labels)
     }
 
-    cluster_user_weight = network_config.cluster_user_weight
     for group_label, group_filter in cluster_groups.items():
         build_transition_network_by_user_group(
             data_df=dataloader.data_gen,
@@ -188,7 +181,9 @@ def main(args_dict: Dict[str, Any]):
             item_cluster_labels=item_cluster_labels,
             save_dir=PLT_RESULT_DIR / "clustered_users",
             meta_df=meta_df,
-            base_weight=cluster_user_weight,
+            embeddings=trainer.book_embeddings,
+            title2idx=title2idx,
+            base_weight=network_config.cluster_user_weight,
             total_users=total_users,
         )
 

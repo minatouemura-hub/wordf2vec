@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +43,7 @@ class Trainer(UserBook2Vec):
         self.dataset = dataset
         self.analogy_path = weight_path.parent / "plt" / "movie_analogy.csv"
         self.weight_path = weight_path
+        self.weight_path.parent.mkdir(exist_ok=True, parents=True)
         self.grid_search = grid_search
 
         self.early_stop_threshold = early_stop_threshold

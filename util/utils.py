@@ -1,7 +1,7 @@
 import argparse  # noqa
 import os  # noqa
 import sys  # noqa
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict  # noqa
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -12,6 +12,7 @@ from matplotlib import colormaps
 from matplotlib.patches import Patch
 from networkx.algorithms.community import greedy_modularity_communities, modularity
 from sklearn.manifold import TSNE
+from sklearn.metrics.pairwise import pairwise_distances
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 from umap import UMAP  # noqa
@@ -45,7 +46,9 @@ def build_transition_network_by_item_cluster(
 
     echo_scores = []
 
-    for cluster_id, relevant_titles in tqdm(cluster_to_titles.items(), desc="ネットワーク構築中"):
+    for cluster_id, relevant_titles in tqdm(
+        cluster_to_titles.items(), desc="アイテムネットワーク構築中"
+    ):
         edge_counter = defaultdict(int)
         for user_id, group in data_df.groupby("userId"):
             group = group.sort_values("timestamp")
@@ -141,111 +144,112 @@ def build_transition_network_by_user_group(
     save_dir,
     meta_df,
     item_cluster_labels,
-    base_weight,
-    total_users,
+    embeddings: np.ndarray,
+    title2idx: dict,
+    base_weight: float,
+    total_users: int,
+    k_nn: int = 5,
+    alpha: float = 0.7,
 ):
+    """
+    ユーザー行動遷移グラフと「埋め込み距離」による KNN グラフを合成したハイブリッドネットワークを作成。
+
+    - alpha: 遷移重みと埋め込み類似度(1/距離)を混合する比率
+    - k_nn: 各ノードから近傍 k_nn 本の埋め込みエッジを張る
+    """
     cmap = colormaps.get_cmap("tab20")
-    # ユーザー属性でフィルタリング
+
+    # 1) 埋め込み距離に基づく KNN グラフを先に構築
+    titles = list(meta_df["title"])
+    # 全タイトルの距離行列（一度だけ計算すると高速）
+    dist_mat = pairwise_distances(embeddings, metric="euclidean")
+    G_emb = nx.DiGraph()
+    for title in titles:
+        i = title2idx.get(title)
+        if i is None:
+            continue
+        # 自分自身を除くソート
+        neigh = np.argsort(dist_mat[i])[1 : k_nn + 1]
+        for j in neigh:
+            tgt = titles[j]
+            d = dist_mat[i, j]
+            if np.isfinite(d):
+                # 類似度として 1/d を重み付け
+                G_emb.add_edge(title, tgt, weight=1.0 / (d + 1e-6))
+
+    # 2) 元の「行動遷移グラフ」を構築
     filtered_df = data_df[group_filter].copy()
     filtered_user_num = int(filtered_df["userId"].nunique())
-    adjusted_weight = int((filtered_user_num / total_users) * base_weight)
-    adjusted_weight = adjusted_weight if adjusted_weight >= 1 else 1
-    print(f"グループ {group_label} のユーザー数: {filtered_user_num}")
+    adjusted_w = max(int(filtered_user_num / total_users * base_weight), 1)
 
-    # 各ユーザーの行動（タイトルの連続）からエッジをカウントする
     edge_counter = defaultdict(int)
-    for user_id, group in filtered_df.groupby("userId"):
-        group = group.sort_values("timestamp")
-        actions = group["title"].tolist()
-        for i in range(len(actions) - 1):
-            src, dst = actions[i], actions[i + 1]
-            edge_counter[(src, dst)] += 1
+    for _, grp in filtered_df.groupby("userId"):
+        actions = grp.sort_values("timestamp")["title"].tolist()
+        for u, v in zip(actions, actions[1:]):
+            edge_counter[(u, v)] += 1
 
-    # adjusted_weight以上のエッジのみを抽出してグラフへ追加
     G = nx.DiGraph()
-    for (src, dst), weight in edge_counter.items():
-        if weight >= adjusted_weight:
-            G.add_edge(src, dst, weight=weight)
+    for (u, v), w in edge_counter.items():
+        if w >= adjusted_w:
+            G.add_edge(u, v, weight=alpha * w)
 
+    # 3) 埋め込み KNN グラフのエッジをマージ
+    for u, v, d in G_emb.edges(data=True):
+        emb_w = (1 - alpha) * d["weight"]
+        if G.has_edge(u, v):
+            G[u][v]["weight"] += emb_w
+        else:
+            G.add_edge(u, v, weight=emb_w)
+
+    # 4) 描画・解析（以下は従来どおり）
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         print(f"グループ {group_label} のネットワークが構築できませんでした。")
         return
 
-    # モジュラリティ計算
-    undirected_G = G.to_undirected()
-    communities = greedy_modularity_communities(undirected_G)
-    mod_value = modularity(undirected_G, communities)
-    print(f"グループ {group_label} のモジュラリティ: {mod_value:.4f}")
+    # モジュラリティ
+    ug = G.to_undirected()
+    comms = greedy_modularity_communities(ug)
+    mod_val = modularity(ug, comms)
+    print(f"グループ {group_label} のモジュラリティ: {mod_val:.4f}")
 
-    # 出次数中心性を計算（ノードサイズの決定に利用）
-    centrality = nx.out_degree_centrality(G)
+    # 入次数中心性
+    centrality = nx.in_degree_centrality(G)
     node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
-    node_sizes = [500 + 3000 * centrality.get(n, 0) for n in G.nodes()]
+    node_sizes = [200 + 5000 * centrality.get(n, 0) for n in G.nodes()]
 
     plt.figure(figsize=(12, 10))
-    pos = nx.spring_layout(G, seed=42, k=1.2)
+    pos = nx.kamada_kawai_layout(G)
     weights = [G[u][v]["weight"] for u, v in G.edges()]
-    max_weight = max(weights) if weights else 1
-    edge_widths = [w * 0.1 for w in weights]
-    edge_alphas = [0.2 + 0.8 * (w / max_weight) for w in weights]
+    max_w = max(weights) if weights else 1
+    widths = [0.2 + 2.8 * (w / max_w) for w in weights]
 
     nx.draw_networkx_nodes(
         G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.6, edgecolors="white"
     )
-    for (u, v), width, alpha in zip(G.edges(), edge_widths, edge_alphas):
-        nx.draw_networkx_edges(
-            G, pos, edgelist=[(u, v)], arrows=True, width=width, edge_color="gray", alpha=alpha
-        )
+    nx.draw_networkx_edges(
+        G, pos, edgelist=list(G.edges()), width=widths, arrowstyle="->", arrowsize=8, alpha=0.4
+    )
 
-    # meta情報（タイトル -> movieId）の辞書を作成
-    title_to_movieId = dict(zip(meta_df["title"], meta_df["movieId"]))  # noqa
-    # 各映画の平均評価を data_df から計算（rating列が存在する前提）
-    avg_ratings = data_df.groupby("title")["rating"].mean().to_dict()
-
-    # ノード中心に平均評価を描画
-    for n in G.nodes():
-        if n in avg_ratings:
-            plt.text(
-                pos[n][0],
-                pos[n][1],
-                f"{avg_ratings[n]:.1f}",
-                fontsize=8,
-                ha="center",
-                va="center",
-                color="black",
-            )
-
-    unique_clusters = set(item_cluster_labels.get(n, -1) for n in G.nodes())
-    legend_elements = [
-        Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ {cid}")
-        for cid in sorted(unique_clusters)
+    legend_elems = [
+        Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ{cid}")
+        for cid in sorted(set(item_cluster_labels.get(n, -1) for n in G.nodes()))
     ]
     plt.legend(
-        handles=legend_elements,
-        title="アイテムの所属クラスタ",
+        handles=legend_elems,
+        title="ノード所属クラスタ",
         loc="upper right",
         fontsize=8,
-        title_fontsize=9,
         frameon=True,
     )
 
-    plt.title(f"ユーザー属性グループ別アイテム遷移ネットワーク（{group_label}）")
-    plt.subplots_adjust(left=0.05, right=0.95, top=0.95, bottom=0.05)
-    save_path = save_dir / f"{group_label}_action_network.png"
+    plt.title(f"ユーザーグループ別ハイブリッドネットワーク（{group_label}）")
+    plt.axis("off")
+    save_path = save_dir / f"{group_label}_hybrid_network.png"
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path)
+    plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
-    # centrality_df = pd.DataFrame.from_dict(
-    #     centrality, orient="index", columns=["out_degree_centrality"]
-    # )
-    # centrality_path = (
-    #     save_dir / "result" / "network" / f"{group_label}_action_network_centrality.csv"
-    # )
-    # centrality_path.parent.mkdir(parents=True, exist_ok=True)
-    # centrality_df.to_csv(centrality_path)
-
-    print(f"グループ {group_label} のネットワーク構築が完了しました。")
+    print(f"グループ {group_label} のハイブリッドネットワーク構築が完了しました。")
 
 
 def print_cluster_counts_and_ratios(item_cluster_labels: dict):
