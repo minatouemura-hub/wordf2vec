@@ -12,4 +12,4 @@
 
 source /work/minato-u/miniconda3/etc/profile.d/conda.sh  # conda 初期化
 conda activate network_env                                    # 仮想環境をアクティベート
-python main.py    
+python main.py   --retrain --grid_search --dataset Movie10M

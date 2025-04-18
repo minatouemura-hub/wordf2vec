@@ -35,7 +35,8 @@ from util import (
 from word2vec import (  # noqa
     BookDataset,
     GridSearch,
-    MovieDataset,
+    Movie1MDataset,
+    Movie10MDataset,
     OptunaSearch,
     Trainer,
 )
@@ -107,10 +108,16 @@ def main(args_dict: Dict[str, Any]):
         dataloader = BookDataset(
             DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
         )
-    else:
+    elif whole_args.dataset == "Movie1M":
         DATA_PATH = BASE_DIR / "ml-1m"
         WEIGHT_PATH = BASE_DIR / "weight_vec" / f"{whole_args.dataset}2vec_model.pth"
-        dataloader = MovieDataset(
+        dataloader = Movie1MDataset(
+            DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
+        )
+    else:
+        DATA_PATH = BASE_DIR / "ml-10m"
+        WEIGHT_PATH = BASE_DIR / "weight_vec" / f"{whole_args.dataset}2vec_model.pth"
+        dataloader = Movie10MDataset(
             DATA_PATH, down_sample=down_sample, sample=sample, min_user_cnt=min_user_cnt
         )
     dataloader.preprocess()
@@ -150,7 +157,7 @@ def main(args_dict: Dict[str, Any]):
         )
 
     vec_df = trainer.vec_df
-    if whole_args.dataset == "Movie":
+    if whole_args.dataset != "Book":
         meta_df = dataloader.data_gen[["movieId", "title", "genres"]].drop_duplicates()
         meta_df["main_genre"] = meta_df["genres"].apply(lambda g: g.split("|")[0])
         _, _, labels = evaluate_clustering_with_genre_sets(
@@ -171,40 +178,40 @@ def main(args_dict: Dict[str, Any]):
         dataloader.data_gen, item_cluster_labels, BASE_DIR, meta_df, network_config.item_weight
     )
 
-    # ==== Graph Kernel によるユーザークラスタリング ====
-    user_graphs, user_ids = build_user_graphs(dataloader.data_gen, sample_n=100, max_workers=4)
-    K = compute_graph_kernel_matrix(user_graphs)
-    user_cluster_labels = cluster_users_by_graph_kernel(K, n_clusters=10)
+    # # ==== Graph Kernel によるユーザークラスタリング ====
+    # user_graphs, user_ids = build_user_graphs(dataloader.data_gen, sample_n=100, max_workers=4)
+    # K = compute_graph_kernel_matrix(user_graphs)
+    # user_cluster_labels = cluster_users_by_graph_kernel(K, n_clusters=10)
 
-    user_df = dataloader.data_gen[["userId", "gender"]].drop_duplicates()
-    user_df = user_df[user_df["userId"].isin(user_ids)].copy()
-    user_df["cluster"] = user_cluster_labels
+    # user_df = dataloader.data_gen[["userId", "gender"]].drop_duplicates()
+    # user_df = user_df[user_df["userId"].isin(user_ids)].copy()
+    # user_df["cluster"] = user_cluster_labels
 
-    # ==== ハイブリッドネットワーク作成 ====
-    PLT_RESULT_DIR = BASE_DIR / "plt" / "network"
-    total_users = dataloader.data_gen["userId"].nunique()
-    title2idx = {title: idx for idx, title in enumerate(vec_df.index)}
+    # # ==== ハイブリッドネットワーク作成 ====
+    # PLT_RESULT_DIR = BASE_DIR / "plt" / "network"
+    # total_users = dataloader.data_gen["userId"].nunique()
+    # title2idx = {title: idx for idx, title in enumerate(vec_df.index)}
 
-    cluster_groups = {
-        f"user_cluster_{cid}": dataloader.data_gen["userId"].isin(
-            user_df[user_df["cluster"] == cid]["userId"]
-        )
-        for cid in np.unique(user_cluster_labels)
-    }
+    # cluster_groups = {
+    #     f"user_cluster_{cid}": dataloader.data_gen["userId"].isin(
+    #         user_df[user_df["cluster"] == cid]["userId"]
+    #     )
+    #     for cid in np.unique(user_cluster_labels)
+    # }
 
-    for group_label, group_filter in cluster_groups.items():
-        build_transition_network_by_user_group(
-            data_df=dataloader.data_gen,
-            group_filter=group_filter,
-            group_label=group_label,
-            item_cluster_labels=item_cluster_labels,
-            save_dir=PLT_RESULT_DIR / "clustered_users",
-            meta_df=meta_df,
-            embeddings=trainer.book_embeddings,
-            title2idx=title2idx,
-            base_weight=network_config.cluster_user_weight,
-            total_users=total_users,
-        )
+    # for group_label, group_filter in cluster_groups.items():
+    #     build_transition_network_by_user_group(
+    #         data_df=dataloader.data_gen,
+    #         group_filter=group_filter,
+    #         group_label=group_label,
+    #         item_cluster_labels=item_cluster_labels,
+    #         save_dir=PLT_RESULT_DIR / "clustered_users",
+    #         meta_df=meta_df,
+    #         embeddings=trainer.book_embeddings,
+    #         title2idx=title2idx,
+    #         base_weight=network_config.cluster_user_weight,
+    #         total_users=total_users,
+    #     )
 
 
 if __name__ == "__main__":

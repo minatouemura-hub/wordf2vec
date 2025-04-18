@@ -7,12 +7,12 @@ from tqdm import tqdm
 
 from arg import Word2VecCongig
 
-from .preprocessor import MovieDataset
+from .preprocessor import Movie1MDataset
 from .trainer import Trainer
 
 
 class GridSearch:
-    def __init__(self, grid_config: Word2VecCongig, weight_path, dataset: "MovieDataset"):
+    def __init__(self, grid_config: Word2VecCongig, weight_path, dataset: "Movie1MDataset"):
         self.grid_config = grid_config
         self.weight_path = weight_path
         self.dataset = dataset

@@ -283,7 +283,7 @@ class BookDataset(object):
         return df_analogy
 
 
-class MovieDataset(object):
+class Movie1MDataset(object):
     def __init__(
         self,
         movie_dir: Path,
@@ -455,3 +455,130 @@ class MovieDataset(object):
         self.analogy_path = analogy_dir / "movie_analogy.csv"
         df_analogy.to_csv(self.analogy_path, index=False)
         return df_analogy
+
+
+class Movie10MDataset(object):
+    """
+    Movielens 10M データセット処理クラス
+    ratings.dat と movies.dat を読み込み、学習用ペアとアナロジータスクを生成します。
+    """
+    def __init__(
+        self,
+        movie_dir: Path,
+        down_sample: bool = True,
+        sample: float = 1e-4,
+        min_user_cnt: int = 3,
+    ):
+        self.movie_dir = movie_dir
+        self.down_sample = down_sample
+        self.sample = sample
+        self.min_user_cnt = min_user_cnt
+
+    def preprocess(self):
+        self._load_dataset()
+        self.mapping()
+        self.make_analogy(base_dir=self.movie_dir.parent, n_samples=100)
+
+    def _load_dataset(self):
+        if not os.path.isdir(self.movie_dir):
+            raise FileExistsError(
+                "10M データセットが見つかりません。Movielens 10M データをダウンロードし、movie_dir に配置してください。"
+            )
+        # ratings.dat の読み込み
+        ratings = pd.read_csv(
+            self.movie_dir / "ratings.dat",
+            sep="::",
+            engine="python",
+            names=["userId", "movieId", "rating", "timestamp"],
+        )
+        # movies.dat の読み込み
+        movies = pd.read_csv(
+            self.movie_dir / "movies.dat",
+            sep="::",
+            engine="python",
+            names=["movieId", "title", "genres"],
+            encoding="latin-1",
+        )
+        # マージ
+        self.data_gen = ratings.merge(movies, on="movieId")
+
+    def mapping(self, target_col: str = "title"):
+        # 各映画のユニーク視聴ユーザー数をカウント
+        user_cnt_per_movie = Counter()
+        for uid, group in self.data_gen.groupby("userId"):
+            uniq_titles = set(group[target_col])
+            for title in uniq_titles:
+                user_cnt_per_movie[title] += 1
+
+        # 最低視聴ユーザー数を満たす映画を抽出
+        filtered_titles = {
+            title for title, cnt in user_cnt_per_movie.items() if cnt >= self.min_user_cnt
+        }
+
+        # 出力先ディレクトリ
+        output_path = Path(self.movie_dir).parent / "result"
+        output_path.mkdir(parents=True, exist_ok=True)
+        with open(output_path / "normed_title_10m.json", "w", encoding="utf-8") as f:
+            json.dump(list(filtered_titles), f, ensure_ascii=False, indent=2)
+
+        # 学習用ペア生成
+        self.book2id = {title: idx for idx, title in enumerate(filtered_titles)}
+        self.id2book = {idx: title for title, idx in self.book2id.items()}
+
+        # ダウンサンプリング確率
+        if self.down_sample:
+            counts = sum(user_cnt_per_movie[t] for t in filtered_titles)
+            freq = {t: user_cnt_per_movie[t] / counts for t in filtered_titles}
+            self.book_keep_prob = {
+                t: 1 - np.sqrt(self.sample / f) if f > self.sample else 1.0 for t, f in freq.items()
+            }
+
+        self.pairs = []
+        for uid, group in tqdm(self.data_gen.groupby("userId"), desc="Pairing (10M)"):
+            user_idx = uid  # raw userId をそのまま使用可能
+            for title in group[target_col]:
+                if title not in self.book2id:
+                    continue
+                if self.down_sample and np.random.rand() < self.book_keep_prob.get(title, 1.0):
+                    continue
+                book_idx = self.book2id[title]
+                self.pairs.append((user_idx, book_idx))
+
+        print(f"フィルタ後の映画数（ユニーク）：{len(self.book2id)} 件")
+
+    def make_analogy(self, base_dir: Path, n_samples: int = 100):
+        """
+        高速化：Pandas の groupby とサンプリングで O(n_samples) に近い計算量でタスク生成
+        """
+        # データコピーと前処理
+        df = self.data_gen.copy()
+        # 年代抽出
+        df['year'] = df['title'].str.extract(r"\((\d{4})\)$")[0].astype(float)
+        df = df.dropna(subset=['year'])
+        df['decade'] = (df['year']//10*10).astype(int)
+        # ジャンルセット化
+        df['genres_set'] = df['genres'].str.split('|').apply(frozenset)
+        # グループ化
+        grouped = df.groupby(['genres_set','decade'])['title'].unique()
+        valid = grouped[grouped.apply(lambda x: len(x)>=4)]
+        keys = list(valid.index)
+        if not keys:
+            return pd.DataFrame()
+        tasks = []
+        for _ in range(n_samples):
+            genres, decade = random.choice(keys)
+            titles = valid[(genres,decade)]
+            A, B, C, D = random.sample(list(titles), 4)
+            tasks.append({
+                'Genre': '|'.join(sorted(genres)),
+                'Decade': f"{decade}s",
+                'A': A, 'B': B, 'C': C, 'D (Answer)': D,
+                'Analogy': f"({A} : {B}) = ({C} : ?)"
+            })
+        df_tasks = pd.DataFrame(tasks)
+        analogy_dir = base_dir / "analogy_10m"
+        analogy_dir.mkdir(parents=True, exist_ok=True)
+        self.analogy_path = analogy_dir / "movie10m_analogy.csv"
+        df_tasks.to_csv(self.analogy_path, index=False)
+        return df_tasks
+
