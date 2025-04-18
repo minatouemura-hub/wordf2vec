@@ -123,7 +123,7 @@ def main(args_dict: Dict[str, Any]):
     dataloader.preprocess()
 
     if whole_args.grid_search_flag:
-        searcher = OptunaSearch(word2vec_config, WEIGHT_PATH, dataloader)
+        searcher = OptunaSearch(word2vec_config = word2vec_config,weight_path =  WEIGHT_PATH, dataset = dataloader)
         best_param, _ = searcher.search()
         trainer = Trainer(
             WEIGHT_PATH,
