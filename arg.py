@@ -33,7 +33,7 @@ class Word2VecCongig:
     embedding_dim: int = 150
     num_negatives: int = 35
     batch_size: int = 124
-    epochs: int = 1
+    epochs: int = 5
     learning_rate: float = 0.01
     scheduler_factor: float = 0.5
     early_stop_threshold: float = 0.01
@@ -61,7 +61,9 @@ class NetworkConfig:
 def get_args() -> Dict[str, Any]:
     parser = argparse.ArgumentParser(description="word2vecf")
 
-    parser.add_argument("--dataset", type=str, default="Movie10M", choices=["Book", "Movie1M","Movie10M"])
+    parser.add_argument(
+        "--dataset", type=str, default="Movie10M", choices=["Book", "Movie1M", "Movie10M"]
+    )
     parser.add_argument("--retrain", action="store_true", help="Retraining word2vec flag")
     parser.add_argument(
         "--recompute_axis", action="store_true", help="Recompute social dimention flag"

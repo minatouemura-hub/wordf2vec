@@ -25,9 +25,9 @@ from cluster_analysis.analysis import (
     find_best_k_by_elbow,
 )
 from data_collection import run_scrape
+from util import build_transition_network_by_user_group  # noqa
 from util import (
     build_transition_network_by_item_cluster,
-    build_transition_network_by_user_group,
     plot_embeddings_tsne,
     plot_with_umap,
     print_cluster_counts_and_ratios,
@@ -123,7 +123,9 @@ def main(args_dict: Dict[str, Any]):
     dataloader.preprocess()
 
     if whole_args.grid_search_flag:
-        searcher = OptunaSearch(word2vec_config = word2vec_config,weight_path =  WEIGHT_PATH, dataset = dataloader)
+        searcher = OptunaSearch(
+            word2vec_config=word2vec_config, weight_path=WEIGHT_PATH, dataset=dataloader
+        )
         best_param, _ = searcher.search()
         trainer = Trainer(
             WEIGHT_PATH,
@@ -152,9 +154,14 @@ def main(args_dict: Dict[str, Any]):
     if not os.path.isfile(WEIGHT_PATH) or whole_args.retrain:
         trainer.train()
     else:
-        trainer._read_weight_vec(
-            device="cuda" if torch.cuda.is_available() else "cpu", weight_path=WEIGHT_PATH
-        )
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+
+        trainer._read_weight_vec(device=device, weight_path=WEIGHT_PATH)
 
     vec_df = trainer.vec_df
     if whole_args.dataset != "Book":
@@ -178,7 +185,7 @@ def main(args_dict: Dict[str, Any]):
         dataloader.data_gen, item_cluster_labels, BASE_DIR, meta_df, network_config.item_weight
     )
 
-    # # ==== Graph Kernel によるユーザークラスタリング ====
+    # ==== Graph Kernel によるユーザークラスタリング ====
     # user_graphs, user_ids = build_user_graphs(dataloader.data_gen, sample_n=100, max_workers=4)
     # K = compute_graph_kernel_matrix(user_graphs)
     # user_cluster_labels = cluster_users_by_graph_kernel(K, n_clusters=10)

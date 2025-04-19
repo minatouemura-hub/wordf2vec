@@ -169,62 +169,57 @@ class BookDataset(object):
             )
 
     def mapping(self, target_col: str = "Title"):
+        # ユーザーIDマッピング
+        user_ids = list(self.data_gen.keys())
+        self.user2id = {uid: i for i, uid in enumerate(user_ids)}
 
-        user_id = list(self.data_gen.keys())
-        self.user2id = {uid: i for i, uid in enumerate(user_id)}
-
-        # ユーザー間で少なくともmin_user_cnt回以上出現しているもの
-        user_cnt_per_books = Counter()
+        # 各本のユニークユーザー数をカウント
+        user_cnt = Counter()
         for uid, books in self.data_gen.items():
-            uniq_books = set(book[target_col] for book in books)
-            for book in uniq_books:
-                user_cnt_per_books[book] += 1
-        filtered_books = {b for b, c in user_cnt_per_books.items() if c >= self.min_user_cnt}
+            for book in set(b[target_col] for b in books):
+                user_cnt[book] += 1
 
-        # 保存先のディレクトリを作成（必要なら）
-        output_path = self.folder_path.parent.parent / "result"
-        output_path.mkdir(parents=True, exist_ok=True)
+        # フィルタリング
+        filtered = {b for b, cnt in user_cnt.items() if cnt >= self.min_user_cnt}
 
-        # 正規化後タイトルをJSONで保存（リスト形式）
-        with open(output_path / "normed_title.json", "w", encoding="utf-8") as f:
-            json.dump(list(filtered_books), f, ensure_ascii=False, indent=2)
+        # book_counts
+        self.book_counts = Counter(
+            [
+                b
+                for books in self.data_gen.values()
+                for b in [bk[target_col] for bk in books]
+                if b in filtered
+            ]
+        )
 
-        book_list = []
+        # IDマッピング
+        titles = sorted(filtered)
+        self.book2id = {t: i for i, t in enumerate(titles)}
+        self.id2book = {i: t for t, i in self.book2id.items()}
 
-        for uid, books in self.data_gen.items():
-            for book in books:
-                title = book[target_col]
-                book_identifier = f"{title}"
-                if title in filtered_books:
-                    book_list.append(book_identifier)
-
-        self.book_counts = Counter(book_list)
-        self.book2id = {}
-        self.id2book = {}
-
-        for i, book in enumerate(self.book_counts.keys()):
-            self.book2id[book] = i
-            self.id2book[i] = book
-        self.pairs = []
+        # ダウンサンプリング用捨棄確率
         if self.down_sample:
-            total_count = sum(self.book_counts.values())
-            book_freq = {b: c / total_count for b, c in self.book_counts.items()}
-            self.book_keep_prob = {
-                b: 1 - np.sqrt(self.sample / f) if f > self.sample else 1.0
-                for b, f in book_freq.items()
+            total = sum(self.book_counts.values())
+            freq = {t: self.book_counts[t] / total for t in titles}
+            # レアアイテムは捨てない: f <= sample -> 0.0, else 1 - sqrt(sample/f)
+            self.book_discard_prob = {
+                t: (1 - np.sqrt(self.sample / f)) if f > self.sample else 0.0
+                for t, f in freq.items()
             }
-        for uid, books in tqdm(self.data_gen.items(), desc="Processing Pairing"):
-            user_idx = self.user2id[uid]
-            for book in books:
-                book_identifier = book[target_col]
-                if self.down_sample and np.random.rand() < self.book_keep_prob.get(
-                    book_identifier, 1.0
-                ):
-                    continue
-                book_idx = self.book2id[book_identifier]
-                self.pairs.append((user_idx, book_idx))
 
-        print(f"フィルタ後の学習対象書籍数（ユニーク）: {len(self.book2id)}")
+        # ペア生成
+        self.pairs = []
+        for uid, books in tqdm(self.data_gen.items(), desc="Pairing BookDataset"):
+            uidx = self.user2id[uid]
+            for b in books:
+                title = b[target_col]
+                if title not in self.book2id:
+                    continue
+                if self.down_sample and random.random() < self.book_discard_prob.get(title, 0.0):
+                    continue
+                self.pairs.append((uidx, self.book2id[title]))
+
+        print(f"BookDataset: filtered items={len(self.book2id)}, pairs={len(self.pairs)}")
 
     def make_analogy(self, base_dir: Path, n_samples: int = 100):
         """
@@ -332,58 +327,48 @@ class Movie1MDataset(object):
         self.data_gen = ratings.merge(users, on="userId").merge(movies, on="movieId")
 
     def mapping(self, target_col: str = "title"):
-        user_id = list(self.data_gen["userId"].unique())
-        self.user2id = {uid: i for i, uid in enumerate(user_id)}
+        # ユーザーIDマッピング
+        user_ids = self.data_gen["userId"].unique().tolist()
+        self.user2id = {uid: i for i, uid in enumerate(user_ids)}
 
-        # 各映画が何人のユーザーに見られたかをカウント（重複なし）
-        user_cnt_per_movie = Counter()
-        for uid, group in self.data_gen.groupby("userId"):
-            uniq_titles = set(group[target_col])
-            for title in uniq_titles:
-                user_cnt_per_movie[title] += 1
+        # 映画のユニークユーザー数
+        user_cnt = Counter()
+        for uid, grp in self.data_gen.groupby("userId"):
+            for t in set(grp[target_col]):
+                user_cnt[t] += 1
 
-        # 最低視聴ユーザー数を満たす映画だけを残す
-        filtered_titles = {
-            title for title, cnt in user_cnt_per_movie.items() if cnt >= self.min_user_cnt
-        }
+        # フィルタ
+        filtered = {t for t, cnt in user_cnt.items() if cnt >= self.min_user_cnt}
+        self.book_counts = Counter(
+            self.data_gen[target_col][self.data_gen[target_col].isin(filtered)]
+        )
 
-        # 保存先
-        output_path = Path(self.movie_dir).parent / "result"
-        output_path.mkdir(parents=True, exist_ok=True)
-        with open(output_path / "normed_title.json", "w", encoding="utf-8") as f:
-            json.dump(list(filtered_titles), f, ensure_ascii=False, indent=2)
+        # IDマッピング
+        titles = sorted(filtered)
+        self.book2id = {t: i for i, t in enumerate(titles)}
+        self.id2book = {i: t for t, i in self.book2id.items()}
 
-        # タイトルごとの出現数カウント（学習で使う）
-        filtered_df = self.data_gen[self.data_gen[target_col].isin(filtered_titles)]
-        movie_list = filtered_df[target_col].tolist()
-        self.book_counts = Counter(movie_list)
-
-        # title <-> ID の対応表
-        self.book2id = {title: i for i, title in enumerate(self.book_counts)}
-        self.id2book = {i: title for title, i in self.book2id.items()}
-
-        # サンプリング確率の計算（出現頻度に基づく）
-        self.pairs = []
+        # ダウンサンプリング確率
         if self.down_sample:
             total = sum(self.book_counts.values())
-            book_freq = {b: c / total for b, c in self.book_counts.items()}
-            self.book_keep_prob = {
-                b: 1 - np.sqrt(self.sample / f) if f > self.sample else 1.0
-                for b, f in book_freq.items()
+            freq = {t: self.book_counts[t] / total for t in titles}
+            self.book_discard_prob = {
+                t: (1 - np.sqrt(self.sample / f)) if f > self.sample else 0.0
+                for t, f in freq.items()
             }
 
-        # ユーザーと映画のペア作成
-        for uid, group in tqdm(self.data_gen.groupby("userId"), desc="Pairing by Title"):
-            user_idx = self.user2id[uid]
-            for title in group[target_col]:
+        # ペア生成
+        self.pairs = []
+        for uid, grp in tqdm(self.data_gen.groupby("userId"), desc="Pairing Movie1M"):
+            uidx = self.user2id[uid]
+            for title in grp[target_col]:
                 if title not in self.book2id:
                     continue
-                if self.down_sample and np.random.rand() < self.book_keep_prob.get(title, 1.0):
+                if self.down_sample and random.random() < self.book_discard_prob.get(title, 0.0):
                     continue
-                book_idx = self.book2id[title]
-                self.pairs.append((user_idx, book_idx))
+                self.pairs.append((uidx, self.book2id[title]))
 
-        print(f"フィルタ後の映画数（ユニークタイトル）: {len(self.book2id)}")
+        print(f"Movie1MDataset: filtered items={len(self.book2id)}, pairs={len(self.pairs)}")
 
     def make_analogy(self, base_dir: Path, n_samples: int = 100):
         """
@@ -462,6 +447,7 @@ class Movie10MDataset(object):
     Movielens 10M データセット処理クラス
     ratings.dat と movies.dat を読み込み、学習用ペアとアナロジータスクを生成します。
     """
+
     def __init__(
         self,
         movie_dir: Path,
@@ -484,14 +470,12 @@ class Movie10MDataset(object):
             raise FileExistsError(
                 "10M データセットが見つかりません。Movielens 10M データをダウンロードし、movie_dir に配置してください。"
             )
-        # ratings.dat の読み込み
         ratings = pd.read_csv(
             self.movie_dir / "ratings.dat",
             sep="::",
             engine="python",
             names=["userId", "movieId", "rating", "timestamp"],
         )
-        # movies.dat の読み込み
         movies = pd.read_csv(
             self.movie_dir / "movies.dat",
             sep="::",
@@ -499,86 +483,95 @@ class Movie10MDataset(object):
             names=["movieId", "title", "genres"],
             encoding="latin-1",
         )
-        # マージ
         self.data_gen = ratings.merge(movies, on="movieId")
 
     def mapping(self, target_col: str = "title"):
-        # 各映画のユニーク視聴ユーザー数をカウント
-        user_cnt_per_movie = Counter()
-        for uid, group in self.data_gen.groupby("userId"):
-            uniq_titles = set(group[target_col])
-            for title in uniq_titles:
-                user_cnt_per_movie[title] += 1
+        # ユーザーIDマッピング
+        user_ids = self.data_gen["userId"].unique().tolist()
+        self.user2id = {uid: i for i, uid in enumerate(user_ids)}
 
-        # 最低視聴ユーザー数を満たす映画を抽出
-        filtered_titles = {
-            title for title, cnt in user_cnt_per_movie.items() if cnt >= self.min_user_cnt
-        }
+        # 映画のユニークユーザー数
+        user_cnt = Counter()
+        for uid, grp in self.data_gen.groupby("userId"):
+            for t in set(grp[target_col]):
+                user_cnt[t] += 1
 
-        # 出力先ディレクトリ
-        output_path = Path(self.movie_dir).parent / "result"
-        output_path.mkdir(parents=True, exist_ok=True)
-        with open(output_path / "normed_title_10m.json", "w", encoding="utf-8") as f:
-            json.dump(list(filtered_titles), f, ensure_ascii=False, indent=2)
+        # フィルタ
+        filtered = {t for t, cnt in user_cnt.items() if cnt >= self.min_user_cnt}
+        self.book_counts = Counter(
+            self.data_gen[target_col][self.data_gen[target_col].isin(filtered)]
+        )
 
-        # 学習用ペア生成
-        self.book2id = {title: idx for idx, title in enumerate(filtered_titles)}
-        self.id2book = {idx: title for title, idx in self.book2id.items()}
+        # IDマッピング
+        titles = sorted(filtered)
+        self.book2id = {t: i for i, t in enumerate(titles)}
+        self.id2book = {i: t for t, i in self.book2id.items()}
 
         # ダウンサンプリング確率
         if self.down_sample:
-            counts = sum(user_cnt_per_movie[t] for t in filtered_titles)
-            freq = {t: user_cnt_per_movie[t] / counts for t in filtered_titles}
-            self.book_keep_prob = {
-                t: 1 - np.sqrt(self.sample / f) if f > self.sample else 1.0 for t, f in freq.items()
+            total = sum(self.book_counts.values())
+            freq = {t: self.book_counts[t] / total for t in titles}
+            self.book_discard_prob = {
+                t: (1 - np.sqrt(self.sample / f)) if f > self.sample else 0.0
+                for t, f in freq.items()
             }
 
+        # ペア生成
         self.pairs = []
-        for uid, group in tqdm(self.data_gen.groupby("userId"), desc="Pairing (10M)"):
-            user_idx = uid  # raw userId をそのまま使用可能
-            for title in group[target_col]:
+        for uid, grp in tqdm(self.data_gen.groupby("userId"), desc="Pairing Movie10M"):
+            uidx = self.user2id[uid]
+            for title in grp[target_col]:
                 if title not in self.book2id:
                     continue
-                if self.down_sample and np.random.rand() < self.book_keep_prob.get(title, 1.0):
+                if self.down_sample and random.random() < self.book_discard_prob.get(title, 0.0):
                     continue
-                book_idx = self.book2id[title]
-                self.pairs.append((user_idx, book_idx))
+                self.pairs.append((uidx, self.book2id[title]))
 
-        print(f"フィルタ後の映画数（ユニーク）：{len(self.book2id)} 件")
+        print(f"Movie10MDataset: filtered items={len(self.book2id)}, pairs={len(self.pairs)}")
 
     def make_analogy(self, base_dir: Path, n_samples: int = 100):
         """
-        高速化：Pandas の groupby とサンプリングで O(n_samples) に近い計算量でタスク生成
+        フィルタ後のタイトルのみを対象に、高速なアナロジータスクを生成
         """
-        # データコピーと前処理
         df = self.data_gen.copy()
-        # 年代抽出
-        df['year'] = df['title'].str.extract(r"\((\d{4})\)$")[0].astype(float)
-        df = df.dropna(subset=['year'])
-        df['decade'] = (df['year']//10*10).astype(int)
-        # ジャンルセット化
-        df['genres_set'] = df['genres'].str.split('|').apply(frozenset)
-        # グループ化
-        grouped = df.groupby(['genres_set','decade'])['title'].unique()
-        valid = grouped[grouped.apply(lambda x: len(x)>=4)]
+        # 年代抽出、欠損除去
+        df["year"] = df["title"].str.extract(r"\((\d{4})\)$")[0].astype(float)
+        df = df.dropna(subset=["year"])
+        df["decade"] = (df["year"] // 10 * 10).astype(int)
+        df["genres_set"] = df["genres"].str.split("|").apply(frozenset)
+
+        # フィルタ後タイトルのみ残す
+        df = df[df["title"].isin(self.book2id)]
+
+        # グループ化して候補抽出
+        grouped = df.groupby(["genres_set", "decade"])["title"].unique()
+        valid = grouped[grouped.apply(lambda x: len(x) >= 4)]
         keys = list(valid.index)
         if not keys:
+            print("No valid analogy groups found.")
             return pd.DataFrame()
+
         tasks = []
         for _ in range(n_samples):
-            genres, decade = random.choice(keys)
-            titles = valid[(genres,decade)]
+            genres, dec = random.choice(keys)
+            titles = valid[(genres, dec)]
             A, B, C, D = random.sample(list(titles), 4)
-            tasks.append({
-                'Genre': '|'.join(sorted(genres)),
-                'Decade': f"{decade}s",
-                'A': A, 'B': B, 'C': C, 'D (Answer)': D,
-                'Analogy': f"({A} : {B}) = ({C} : ?)"
-            })
-        df_tasks = pd.DataFrame(tasks)
-        analogy_dir = base_dir / "analogy_10m"
-        analogy_dir.mkdir(parents=True, exist_ok=True)
-        self.analogy_path = analogy_dir / "movie10m_analogy.csv"
-        df_tasks.to_csv(self.analogy_path, index=False)
-        return df_tasks
+            tasks.append(
+                {
+                    "Genre": "|".join(sorted(genres)),
+                    "Decade": f"{int(dec)}s",
+                    "A": A,
+                    "B": B,
+                    "C": C,
+                    "D (Answer)": D,
+                    "Analogy": f"({A} : {B}) = ({C} : ?)",
+                }
+            )
 
+        df_tasks = pd.DataFrame(tasks)
+        out_dir = base_dir / "analogy_10m"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self.analogy_path = out_dir / "movie10m_analogy.csv"
+        df_tasks.to_csv(self.analogy_path, index=False)
+        print(f"Saved analogy tasks to {self.analogy_path}")
+        return df_tasks
