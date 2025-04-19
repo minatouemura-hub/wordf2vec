@@ -569,7 +569,7 @@ class Movie10MDataset(object):
             )
 
         df_tasks = pd.DataFrame(tasks)
-        out_dir = base_dir / "analogy_10m"
+        out_dir = base_dir / "analogy"
         out_dir.mkdir(parents=True, exist_ok=True)
         self.analogy_path = out_dir / "movie10m_analogy.csv"
         df_tasks.to_csv(self.analogy_path, index=False)

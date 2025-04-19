@@ -9,6 +9,7 @@ class WholeConfig:
     dataset: str = "Movie"
     retrain: bool = True
     grid_search_flag: bool = True
+    fast_greedy_compare: bool = True
 
 
 @dataclass
@@ -70,6 +71,11 @@ def get_args() -> Dict[str, Any]:
     )
     parser.add_argument(
         "--grid_search_flag", action="store_true", help="Flag for whether grid_search"
+    )
+    parser.add_argument(
+        "--fast_greedy_compare",
+        action="store_true",
+        help="Flag for comparison between ours model vs FG",
     )
 
     parser.add_argument(

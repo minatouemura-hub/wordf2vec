@@ -27,6 +27,11 @@ from gender_axis.projection import Project_On  # noqa
 from word2vec import Trainer  # noqa
 
 
+def adjusted_lrap(lrap: float, k: int, k_max: int, alpha: float = 1.0) -> float:
+    penalty = np.exp(-alpha * (k_max - k) / k_max)
+    return lrap * penalty
+
+
 # 必要なライブラリのインポート
 class Balanced_Kmeans(ClusterConfig):
     def __init__(self, vec_df: pd.DataFrame, meta_df: pd.DataFrame, n_cluster: int = 5):
@@ -249,7 +254,7 @@ def detect_user_change_points(vec_series: np.ndarray, pen: int = 5) -> list:
 
 def find_best_k_by_elbow(user_embeddings, max_k=10):
     distortions = []
-    K = range(5, max_k + 1)
+    K = range(4, max_k + 1)
     for k in K:
         kmeans = KMeans(n_clusters=k, random_state=42)
         kmeans.fit(user_embeddings)
@@ -324,6 +329,61 @@ def evaluate_clustering_with_genre_sets(
     )
 
     lrap = label_ranking_average_precision_score(Y, genre_score_matrix)
-    print(f"✅ Label Ranking Average Precision (LRAP): {lrap:.4f}")
+    adj_lrap = adjusted_lrap(lrap, optimal_k, 30, 1.0)
+
+    print(f"✅ LRAP: {lrap:.4f}  / Adjusted LRAP: {adj_lrap:.4f}")
 
     return cluster_genre_dist, lrap, cluster_labels
+
+
+def evaluate_fast_greedy_with_genre_sets(item_cluster_labels, meta_df, save_dir: Path):
+    print("\n▶️ Fast Greedyクラスタに対するマルチジャンル評価を実行中...")
+
+    df = pd.DataFrame(
+        {"title": list(item_cluster_labels.keys()), "cluster": list(item_cluster_labels.values())}
+    )
+    df = df.merge(meta_df[["title", "genres"]], on="title", how="left")
+    df["genre_list"] = df["genres"].apply(lambda x: x.split("|") if pd.notnull(x) else [])
+
+    mlb = MultiLabelBinarizer()
+    Y = mlb.fit_transform(df["genre_list"])
+    genres = mlb.classes_
+
+    n_clusters = len(set(item_cluster_labels.values()))
+    cluster_genre_dist = pd.DataFrame(0, index=range(n_clusters), columns=genres)
+
+    for cl in range(n_clusters):
+        labels_list = df[df["cluster"] == cl]["genre_list"]
+        counts = pd.Series([g for sub in labels_list for g in sub]).value_counts()
+        for g in counts.index:
+            cluster_genre_dist.loc[cl, g] = counts[g]
+
+    cluster_genre_dist_norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
+
+    # ヒートマップの描画と保存
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    zscore_df = (
+        cluster_genre_dist_norm - cluster_genre_dist_norm.mean()
+    ) / cluster_genre_dist_norm.std()
+    plt.figure(figsize=(14, 6))
+    sns.heatmap(zscore_df, annot=True, fmt=".2f", cmap="RdBu_r", center=0)
+    plt.title("Fast Greedy Cluster-wise Multi-Genre Distribution (z-score)")
+    plt.ylabel("Cluster")
+    plt.xlabel("Genre")
+    plt.tight_layout()
+    plt.savefig(save_dir / "plt" / "fast_greedy_cluster_genre_zscore.png")
+    plt.close()
+
+    # 各サンプルごとのクラスタに対応するジャンルスコアを取得
+    genre_scores = df["cluster"].map(cluster_genre_dist_norm.to_dict(orient="index"))
+    genre_score_matrix = (
+        pd.DataFrame(list(genre_scores), index=df.index)[mlb.classes_].fillna(0).values
+    )
+
+    lrap = label_ranking_average_precision_score(Y, genre_score_matrix)
+    adj_lrap = adjusted_lrap(lrap, n_clusters, 30, 1.0)
+
+    print(f"✅ LRAP: {lrap:.4f}  / Adjusted LRAP: {adj_lrap:.4f}")
+    return lrap

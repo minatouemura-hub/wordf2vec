@@ -22,12 +22,14 @@ from arg import get_args, parse_config
 from cluster_analysis.analysis import Balanced_Kmeans  # noqa
 from cluster_analysis.analysis import (
     evaluate_clustering_with_genre_sets,
+    evaluate_fast_greedy_with_genre_sets,
     find_best_k_by_elbow,
 )
 from data_collection import run_scrape
 from util import build_transition_network_by_user_group  # noqa
 from util import (
     build_transition_network_by_item_cluster,
+    fast_greedy_clustering_from_network,
     plot_embeddings_tsne,
     plot_with_umap,
     print_cluster_counts_and_ratios,
@@ -184,6 +186,13 @@ def main(args_dict: Dict[str, Any]):
     build_transition_network_by_item_cluster(
         dataloader.data_gen, item_cluster_labels, BASE_DIR, meta_df, network_config.item_weight
     )
+
+    if whole_args.fast_greedy_compare:
+        fg_cluster_labels, fg_graph = fast_greedy_clustering_from_network(dataloader.data_gen)
+        if meta_df is not None:
+            evaluate_fast_greedy_with_genre_sets(
+                item_cluster_labels=fg_cluster_labels, meta_df=meta_df, save_dir=BASE_DIR
+            )
 
     # ==== Graph Kernel によるユーザークラスタリング ====
     # user_graphs, user_ids = build_user_graphs(dataloader.data_gen, sample_n=100, max_workers=4)

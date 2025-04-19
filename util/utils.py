@@ -336,3 +336,27 @@ def plot_with_umap(embeddings, labels=None, label_name="embedding", umap_dir=Non
     save_path = umap_dir / f"{label_name}_umap.png"
     plt.savefig(save_path)
     plt.close()
+
+
+def fast_greedy_clustering_from_network(data_df: pd.DataFrame):
+    try:
+        import community as community_louvain
+    except ImportError:
+        raise ImportError("community (python-louvain) module not found. Please install it via pip.")
+
+    item_graph = nx.Graph()
+    transitions = data_df.sort_values("timestamp").groupby("userId")["title"].apply(list)
+    for title_list in transitions:
+        for u, v in zip(title_list, title_list[1:]):
+            item_graph.add_edge(u, v)
+
+    partition = community_louvain.best_partition(item_graph)
+    return dict(partition), item_graph
+
+
+def main():
+    return
+
+
+if __name__ == "__main__":
+    main()
