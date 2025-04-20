@@ -60,39 +60,66 @@ def build_transition_network_by_item_cluster(
 
         G = nx.DiGraph()
         for (src, dst), weight in edge_counter.items():
-            if weight >= min_weight:
-                G.add_edge(src, dst, weight=weight)
+            G.add_edge(src, dst, weight=weight)  # ← すべてのエッジを一旦追加
 
         if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
             continue
 
-        centrality = nx.out_degree_centrality(G)
-        node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in G.nodes()]
-        node_sizes = [500 + 3000 * centrality.get(n, 0) for n in G.nodes()]
+        # === モジュラリティを全エッジで評価 ===
+        ug = G.to_undirected()
+        communities = greedy_modularity_communities(ug)
+        mod_score = modularity(ug, communities)
+        print(f"クラスタ {cluster_id} のモジュラリティ（全エッジ使用）: {mod_score:.4f}")
+
+        # === 可視化対象のエッジ（min_weight以上）だけ残す ===
+        filtered_G = nx.DiGraph()
+        for (u, v), d in G.edges.items():
+            if d["weight"] >= min_weight:
+                filtered_G.add_edge(u, v, weight=d["weight"])
+
+        if filtered_G.number_of_edges() == 0:
+            continue
+
+        centrality = nx.out_degree_centrality(filtered_G)
+        node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in filtered_G.nodes()]
+        node_sizes = [500 + 3000 * centrality.get(n, 0) for n in filtered_G.nodes()]
 
         plt.figure(figsize=(12, 10))
-        pos = nx.spring_layout(G, seed=42, k=1.2)
-        weights = [G[u][v]["weight"] for u, v in G.edges()]
+        pos = nx.spring_layout(filtered_G, seed=42, k=1.2)
+        weights = [filtered_G[u][v]["weight"] for u, v in filtered_G.edges()]
         max_weight = max(weights)
         edge_widths = [w * 0.1 for w in weights]
         edge_alphas = [0.2 + 0.8 * (w / max_weight) for w in weights]
 
         nx.draw_networkx_nodes(
-            G, pos, node_color=node_colors, node_size=node_sizes, alpha=0.6, edgecolors="white"
+            filtered_G,
+            pos,
+            node_color=node_colors,
+            node_size=node_sizes,
+            alpha=0.6,
+            edgecolors="white",
         )
-        for (u, v), width, alpha in zip(G.edges(), edge_widths, edge_alphas):
+        for (u, v), width, alpha in zip(filtered_G.edges(), edge_widths, edge_alphas):
             nx.draw_networkx_edges(
-                G, pos, edgelist=[(u, v)], arrows=True, width=width, edge_color="gray", alpha=alpha
+                filtered_G,
+                pos,
+                edgelist=[(u, v)],
+                arrows=True,
+                width=width,
+                edge_color="gray",
+                alpha=alpha,
             )
 
         label_nodes = {
             n: str(title_to_movieId[n])
-            for n in G.nodes()
+            for n in filtered_G.nodes()
             if (500 + 1500 * centrality.get(n, 0)) > 700 and n in title_to_movieId
         }
-        nx.draw_networkx_labels(G, pos, labels=label_nodes, font_size=8, font_color="black")
+        nx.draw_networkx_labels(
+            filtered_G, pos, labels=label_nodes, font_size=8, font_color="black"
+        )
 
-        unique_clusters = set(item_cluster_labels.get(n, -1) for n in G.nodes())
+        unique_clusters = set(item_cluster_labels.get(n, -1) for n in filtered_G.nodes())
         legend_elements = [
             Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ {cid}")
             for cid in sorted(unique_clusters)
@@ -122,13 +149,16 @@ def build_transition_network_by_item_cluster(
             / f"item_transition_network_cluster_{cluster_id}_centrality.csv"
         )
 
-        score, internal, external = compute_echo_chamber_score(G, item_cluster_labels, cluster_id)
+        score, internal, external = compute_echo_chamber_score(
+            filtered_G, item_cluster_labels, cluster_id
+        )
         echo_scores.append(
             {
                 "cluster_id": cluster_id,
                 "echo_chamber_score": score,
                 "internal_edges": internal,
                 "external_edges": external,
+                "modularity": mod_score,
             }
         )
 
