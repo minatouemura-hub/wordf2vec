@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
 import pandas as pd  # noqa
+import seaborn as sns
 from matplotlib import colormaps
 from matplotlib.patches import Patch
 from networkx.algorithms.community import greedy_modularity_communities, modularity
@@ -43,8 +44,6 @@ def build_transition_network_by_item_cluster(
     cluster_to_titles = defaultdict(set)
     for title, cluster_id in item_cluster_labels.items():
         cluster_to_titles[cluster_id].add(title)
-
-    echo_scores = []
 
     for cluster_id, relevant_titles in tqdm(
         cluster_to_titles.items(), desc="アイテムネットワーク構築中"
@@ -149,23 +148,6 @@ def build_transition_network_by_item_cluster(
             / f"item_transition_network_cluster_{cluster_id}_centrality.csv"
         )
 
-        score, internal, external = compute_echo_chamber_score(
-            filtered_G, item_cluster_labels, cluster_id
-        )
-        echo_scores.append(
-            {
-                "cluster_id": cluster_id,
-                "echo_chamber_score": score,
-                "internal_edges": internal,
-                "external_edges": external,
-                "modularity": mod_score,
-            }
-        )
-
-    pd.DataFrame(echo_scores).to_csv(
-        save_dir / "result" / "network" / "echo_chamber_scores.csv", index=False
-    )
-
 
 def build_transition_network_by_user_group(
     data_df,
@@ -232,10 +214,9 @@ def build_transition_network_by_user_group(
         return
 
     # モジュラリティ（全体グラフで評価）
-    ug = G.to_undirected()
-    comms = greedy_modularity_communities(ug)
-    mod_val = modularity(ug, comms)
-    print(f"グループ {group_label} のモジュラリティ: {mod_val:.4f}")
+    # ug = G.to_undirected()
+    # comms = greedy_modularity_communities(ug)
+    # mod_val = modularity(ug, comms)
 
     # 可視化：閾値以上の重みを持つエッジのみ抽出
     important_edges = [(u, v) for u, v in G.edges() if G[u][v]["weight"] >= edge_weight_threshold]
@@ -382,6 +363,169 @@ def fast_greedy_clustering_from_network(data_df: pd.DataFrame):
 
     partition = community_louvain.best_partition(item_graph)
     return dict(partition), item_graph
+
+
+def analyze_cluster_transitions(data_df, item_cluster_labels, save_dir):
+
+    transition_counts = defaultdict(Counter)
+    return_step_counts = defaultdict(list)
+    total_visits = Counter()
+    unique_return_users = defaultdict(set)
+
+    # 各ユーザーの行動を時系列順に取得
+    for user_id, group in data_df.groupby("userId"):
+        actions = group.sort_values("timestamp")["title"].tolist()
+        clusters = [
+            item_cluster_labels.get(title, -1) for title in actions if title in item_cluster_labels
+        ]
+
+        prev_cluster = None
+        last_seen = {}
+        for step, curr_cluster in enumerate(clusters):
+            total_visits[curr_cluster] += 1
+            if prev_cluster is not None and prev_cluster != curr_cluster:
+                transition_counts[prev_cluster][curr_cluster] += 1
+                if curr_cluster in last_seen:
+                    return_step = step - last_seen[curr_cluster]
+                    if return_step > 1:  # 即時回帰を除外
+                        return_step_counts[curr_cluster].append(return_step)
+                        unique_return_users[curr_cluster].add(user_id)
+            last_seen[curr_cluster] = step
+            prev_cluster = curr_cluster
+
+    # 遷移確率行列の可視化
+    cluster_ids = sorted(set(item_cluster_labels.values()))
+    matrix = pd.DataFrame(index=cluster_ids, columns=cluster_ids).fillna(0.0)
+    for src in transition_counts:
+        total = sum(transition_counts[src].values())
+        for tgt in transition_counts[src]:
+            matrix.loc[src, tgt] = transition_counts[src][tgt] / total
+
+    save_path = Path(save_dir) / "plt" / "cluster_transition"
+    save_path.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(matrix, annot=True, cmap="Blues", fmt=".2f")
+    plt.title("Cluster-to-Cluster Transition Probability")
+    plt.xlabel("To Cluster")
+    plt.ylabel("From Cluster")
+    plt.savefig(save_path / "transition_matrix.png")
+    plt.close()
+
+    # 戻りステップ数の分布と統計指標の保存
+    stats = []
+    for cluster_id, steps in return_step_counts.items():
+        if steps:
+            plt.figure()
+            sns.histplot(steps, bins=20, kde=True)
+            plt.title(f"Return Step Distribution to Cluster {cluster_id}")
+            plt.xlabel("Steps Until Return")
+            plt.ylabel("Frequency")
+            plt.savefig(save_path / f"return_steps_cluster_{cluster_id}.png")
+            plt.close()
+
+            avg_step = np.mean(steps)
+            return_rate = len(unique_return_users[cluster_id]) / total_visits[cluster_id]
+            stats.append((cluster_id, avg_step, return_rate))
+
+    if stats:
+        stat_df = pd.DataFrame(stats, columns=["Cluster", "AvgReturnStep", "ReturnRate"])
+        stat_df.to_csv(save_path / "return_stats.csv", index=False)
+        print("[INFO] 平均戻りステップ数と回帰率を保存しました。")
+
+    print("[INFO] クラスタ間遷移と戻りステップの分析が完了しました。")
+
+
+def plot_rating_over_exposures(
+    data_df, item_cluster_labels, save_dir, min_cluster_samples: int = 50
+):
+    """
+    MEE 検証用プロット生成関数
+    1) rating をユーザ z-score 正規化
+    2) 全クラスタ統合の MEE 曲線を描画
+    3) sample 数が min_cluster_samples 未満のクラスタを除外し
+       各クラスタ別 MEE 曲線を補助的に描画
+    """
+
+    base_path = Path(save_dir) / "plt" / "mee_plot"
+    base_path.mkdir(parents=True, exist_ok=True)
+    cluster_path = base_path / "by_cluster"
+    cluster_path.mkdir(parents=True, exist_ok=True)
+
+    # --- ① rating のユーザ基準化（z-score） ------------------------------
+    data_df = data_df.copy()
+    user_stats = data_df.groupby("userId")["rating"].agg(["mean", "std"]).reset_index()
+    user_stats["std"].replace(0, 1e-6, inplace=True)  # 分散ゼロ対策
+    data_df = data_df.merge(user_stats, on="userId", how="left")
+    data_df["rating_z"] = (data_df["rating"] - data_df["mean"]) / data_df["std"]
+
+    # --- ② クラスタ情報付与と exposure 計算 ------------------------------
+    data_df["cluster"] = data_df["title"].map(item_cluster_labels)
+    data_df.dropna(subset=["cluster"], inplace=True)
+    data_df = data_df.sort_values(["userId", "timestamp"])
+    data_df["cluster_exposure"] = data_df.groupby(["userId", "cluster"]).cumcount() + 1
+
+    # pair 単位の総 exposure
+    repetition_counts = data_df.groupby(["userId", "cluster"]).size().reset_index(name="total_reps")
+    data_df = data_df.merge(repetition_counts, on=["userId", "cluster"])
+
+    # 5〜50回にトリミング
+    data_df = data_df[(data_df["total_reps"] >= 5) & (data_df["total_reps"] <= 50)]
+
+    # rep クラス付与
+    def categorize(rep):
+        return (
+            "LowRep"
+            if rep <= 16
+            else "ModRep" if rep <= 27 else "HighRep" if rep <= 38 else "VHRep"
+        )
+
+    data_df["rep_class"] = data_df["total_reps"].apply(categorize)
+
+    # ===== ③ 統合プロット =================================================
+    plot_df_all = (
+        data_df.groupby(["rep_class", "cluster_exposure"])["rating_z"].mean().reset_index()
+    )
+    plt.figure(figsize=(10, 6))
+    for cls in ["LowRep", "ModRep", "HighRep", "VHRep"]:
+        cls_df = plot_df_all[plot_df_all["rep_class"] == cls]
+        plt.plot(cls_df["cluster_exposure"], cls_df["rating_z"], label=cls, marker="o")
+    plt.title("Average *Z-scored* Rating over Cluster Exposure (All Clusters)")
+    plt.xlabel("Exposure Count to Same Cluster")
+    plt.ylabel("Average Z-scored Rating")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(base_path / "cluster_based_mee_plot.png")
+    plt.close()
+
+    # ===== ④ クラスタ別プロット ==========================================
+    cluster_counts = data_df["cluster"].value_counts()
+    valid_clusters = cluster_counts[cluster_counts >= min_cluster_samples].index
+    plot_df_by_cluster = (
+        data_df[data_df["cluster"].isin(valid_clusters)]
+        .groupby(["cluster", "rep_class", "cluster_exposure"])["rating_z"]
+        .mean()
+        .reset_index()
+    )
+    for cluster_id in sorted(valid_clusters):
+        cdf = plot_df_by_cluster[plot_df_by_cluster["cluster"] == cluster_id]
+        plt.figure(figsize=(10, 6))
+        for cls in ["LowRep", "ModRep", "HighRep", "VHRep"]:
+            tmp = cdf[cdf["rep_class"] == cls]
+            if not tmp.empty:
+                plt.plot(tmp["cluster_exposure"], tmp["rating_z"], label=cls, marker="o")
+        plt.title(f"Cluster {cluster_id}: Z-scored Rating over Exposure (n≥{min_cluster_samples})")
+        plt.xlabel("Exposure Count to Same Cluster")
+        plt.ylabel("Average Z-scored Rating")
+        plt.legend()
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig(cluster_path / f"cluster_{cluster_id}_mee_plot.png")
+        plt.close()
+
+    print(
+        f"[INFO] MEE プロット（ユーザz-score & n≥{min_cluster_samples}クラスタ）保存先: {base_path}"
+    )
 
 
 def main():

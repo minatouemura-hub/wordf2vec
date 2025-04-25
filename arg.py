@@ -34,7 +34,7 @@ class Word2VecCongig:
     embedding_dim: int = 150
     num_negatives: int = 35
     batch_size: int = 124
-    epochs: int = 5
+    epochs: int = 10
     learning_rate: float = 0.01
     scheduler_factor: float = 0.5
     early_stop_threshold: float = 0.01
