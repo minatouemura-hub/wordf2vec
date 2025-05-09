@@ -46,7 +46,7 @@ class Word2VecCongig:
 @dataclass
 class ClusterConfig:
     tolerance_ratio: float = 0.15
-    max_iter: int = 200
+    max_iter: int = 150
     cluster_search_range: list = field(default_factory=lambda: [10, 50])
     tol: float = 1e-4
     random_state: int = 42

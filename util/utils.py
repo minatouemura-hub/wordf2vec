@@ -1,5 +1,6 @@
 import argparse  # noqa
 import os  # noqa
+import re
 import sys  # noqa
 from collections import Counter, defaultdict  # noqa
 from pathlib import Path
@@ -9,12 +10,13 @@ import networkx as nx
 import numpy as np
 import pandas as pd  # noqa
 import seaborn as sns
+import statsmodels.api as sm
 from matplotlib import colormaps
 from matplotlib.patches import Patch
-from networkx.algorithms.community import greedy_modularity_communities, modularity
+from scipy.stats import sem
 from sklearn.manifold import TSNE
-from sklearn.metrics.pairwise import pairwise_distances
 from sklearn.preprocessing import StandardScaler
+from sklearn.utils import resample
 from tqdm import tqdm
 from umap import UMAP  # noqa
 
@@ -64,11 +66,11 @@ def build_transition_network_by_item_cluster(
         if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
             continue
 
-        # === モジュラリティを全エッジで評価 ===
-        ug = G.to_undirected()
-        communities = greedy_modularity_communities(ug)
-        mod_score = modularity(ug, communities)
-        print(f"クラスタ {cluster_id} のモジュラリティ（全エッジ使用）: {mod_score:.4f}")
+        # # === モジュラリティを全エッジで評価 ===
+        # ug = G.to_undirected()
+        # communities = greedy_modularity_communities(ug)
+        # mod_score = modularity(ug, communities)
+        # print(f"クラスタ {cluster_id} のモジュラリティ（全エッジ使用）: {mod_score:.4f}")
 
         # === 可視化対象のエッジ（min_weight以上）だけ残す ===
         filtered_G = nx.DiGraph()
@@ -149,130 +151,6 @@ def build_transition_network_by_item_cluster(
         )
 
 
-def build_transition_network_by_user_group(
-    data_df,
-    group_filter,
-    group_label,
-    save_dir,
-    meta_df,
-    item_cluster_labels,
-    embeddings: np.ndarray,
-    title2idx: dict,
-    base_weight: float,
-    total_users: int,
-    k_nn: int = 5,
-    alpha: float = 0.7,
-    edge_weight_threshold: float = 1.0,  # 描画対象のエッジ重みの閾値
-):
-    """
-    ユーザー行動遷移グラフと埋め込み類似度による KNN グラフを合成し、
-    可視化時には一定以上の重みを持つエッジのみを残す。
-    """
-    cmap = colormaps.get_cmap("tab20")
-
-    # 1) 埋め込み距離に基づく KNN グラフを構築
-    titles = list(meta_df["title"])
-    dist_mat = pairwise_distances(embeddings, metric="euclidean")
-    G_emb = nx.DiGraph()
-    for title in titles:
-        i = title2idx.get(title)
-        if i is None:
-            continue
-        neigh = np.argsort(dist_mat[i])[1 : k_nn + 1]
-        for j in neigh:
-            tgt = titles[j]
-            d = dist_mat[i, j]
-            if np.isfinite(d):
-                G_emb.add_edge(title, tgt, weight=1.0 / (d + 1e-6))
-
-    # 2) 行動遷移グラフを構築
-    filtered_df = data_df[group_filter].copy()
-    filtered_user_num = int(filtered_df["userId"].nunique())
-    adjusted_w = max(int(filtered_user_num / total_users * base_weight), 1)
-
-    edge_counter = defaultdict(int)
-    for _, grp in filtered_df.groupby("userId"):
-        actions = grp.sort_values("timestamp")["title"].tolist()
-        for u, v in zip(actions, actions[1:]):
-            edge_counter[(u, v)] += 1
-
-    G = nx.DiGraph()
-    for (u, v), w in edge_counter.items():
-        if w >= adjusted_w:
-            G.add_edge(u, v, weight=alpha * w)
-
-    # 3) 埋め込み KNN グラフのエッジをマージ
-    for u, v, d in G_emb.edges(data=True):
-        emb_w = (1 - alpha) * d["weight"]
-        if G.has_edge(u, v):
-            G[u][v]["weight"] += emb_w
-        else:
-            G.add_edge(u, v, weight=emb_w)
-
-    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-        print(f"グループ {group_label} のネットワークが構築できませんでした。")
-        return
-
-    # モジュラリティ（全体グラフで評価）
-    # ug = G.to_undirected()
-    # comms = greedy_modularity_communities(ug)
-    # mod_val = modularity(ug, comms)
-
-    # 可視化：閾値以上の重みを持つエッジのみ抽出
-    important_edges = [(u, v) for u, v in G.edges() if G[u][v]["weight"] >= edge_weight_threshold]
-    drawn_nodes = set([u for u, v in important_edges] + [v for u, v in important_edges])
-
-    if not drawn_nodes:
-        print(f"グループ {group_label} に表示可能なノードがありません。")
-        return
-
-    # 可視ノードに対応する中心性
-    centrality = nx.in_degree_centrality(G)
-    node_colors = [cmap(item_cluster_labels.get(n, -1) % 20) for n in drawn_nodes]
-    node_sizes = [200 + 5000 * centrality.get(n, 0) for n in drawn_nodes]
-
-    # レイアウト・描画
-    plt.figure(figsize=(12, 10))
-    pos = nx.kamada_kawai_layout(G)
-    weights = [G[u][v]["weight"] for u, v in important_edges]
-    max_w = max(weights) if weights else 1
-    widths = [0.2 + 2.8 * (w / max_w) for w in weights]
-
-    nx.draw_networkx_nodes(
-        G,
-        pos,
-        nodelist=drawn_nodes,
-        node_color=node_colors,
-        node_size=node_sizes,
-        alpha=0.6,
-        edgecolors="white",
-    )
-    nx.draw_networkx_edges(
-        G, pos, edgelist=important_edges, width=widths, arrowstyle="->", arrowsize=8, alpha=0.4
-    )
-
-    legend_elems = [
-        Patch(facecolor=cmap(cid % 20), edgecolor="black", label=f"クラスタ{cid}")
-        for cid in sorted(set(item_cluster_labels.get(n, -1) for n in drawn_nodes))
-    ]
-    plt.legend(
-        handles=legend_elems,
-        title="ノード所属クラスタ",
-        loc="upper right",
-        fontsize=8,
-        frameon=True,
-    )
-
-    plt.title(f"ユーザーグループ別ハイブリッドネットワーク（{group_label}）")
-    plt.axis("off")
-    save_path = save_dir / f"{group_label}_hybrid_network.png"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(save_path, bbox_inches="tight")
-    plt.close()
-
-    print(f"グループ {group_label} のハイブリッドネットワーク構築が完了しました。")
-
-
 def print_cluster_counts_and_ratios(item_cluster_labels: dict):
     """
     各クラスタに属する映画タイトルの数と全体に対する割合を表示する関数。
@@ -306,7 +184,7 @@ def plot_embeddings_tsne(embeddings, save_dir: Path, labels=None, label_name="em
     embeddings = StandardScaler().fit_transform(embeddings)
 
     # t-SNE 設定（初期化方法・繰り返し回数・perplexity を明示）
-    tsne = TSNE(n_components=2, perplexity=30, random_state=42, init="pca", n_iter=2000)
+    tsne = TSNE(n_components=2, perplexity=50, random_state=42, init="pca", n_iter=500)
     emb_2d = tsne.fit_transform(embeddings)
 
     # プロット
@@ -387,145 +265,630 @@ def analyze_cluster_transitions(data_df, item_cluster_labels, save_dir):
                 transition_counts[prev_cluster][curr_cluster] += 1
                 if curr_cluster in last_seen:
                     return_step = step - last_seen[curr_cluster]
-                    if return_step > 1:  # 即時回帰を除外
-                        return_step_counts[curr_cluster].append(return_step)
-                        unique_return_users[curr_cluster].add(user_id)
+                    return_step_counts[curr_cluster].append(return_step)
+                    unique_return_users[curr_cluster].add(user_id)
             last_seen[curr_cluster] = step
             prev_cluster = curr_cluster
 
     # 遷移確率行列の可視化
-    cluster_ids = sorted(set(item_cluster_labels.values()))
-    matrix = pd.DataFrame(index=cluster_ids, columns=cluster_ids).fillna(0.0)
+    valid_clusters = sorted([cid for cid, cnt in total_visits.items() if cnt >= 30])
+
+    # --- 遷移確率行列の可視化（行・列とも valid_clusters のみ） ---
+    matrix = pd.DataFrame(index=valid_clusters, columns=valid_clusters).fillna(0.0)
     for src in transition_counts:
-        total = sum(transition_counts[src].values())
-        for tgt in transition_counts[src]:
-            matrix.loc[src, tgt] = transition_counts[src][tgt] / total
+        if src not in valid_clusters:
+            continue
+        total = sum(
+            transition_counts[src][tgt] for tgt in transition_counts[src] if tgt in valid_clusters
+        )
+        if total == 0:
+            continue
+        for tgt, cnt in transition_counts[src].items():
+            if tgt in valid_clusters:
+                matrix.loc[src, tgt] = cnt / total
 
     save_path = Path(save_dir) / "plt" / "cluster_transition"
     save_path.mkdir(parents=True, exist_ok=True)
     plt.figure(figsize=(10, 8))
-    sns.heatmap(matrix, annot=True, cmap="Blues", fmt=".2f")
+    # annot=False にして数値を非表示
+    sns.heatmap(
+        matrix, annot=False, cmap="Blues", xticklabels=valid_clusters, yticklabels=valid_clusters
+    )
     plt.title("Cluster-to-Cluster Transition Probability")
     plt.xlabel("To Cluster")
     plt.ylabel("From Cluster")
     plt.savefig(save_path / "transition_matrix.png")
     plt.close()
-
-    # 戻りステップ数の分布と統計指標の保存
     stats = []
     for cluster_id, steps in return_step_counts.items():
-        if steps:
-            plt.figure()
-            sns.histplot(steps, bins=20, kde=True)
-            plt.title(f"Return Step Distribution to Cluster {cluster_id}")
-            plt.xlabel("Steps Until Return")
-            plt.ylabel("Frequency")
-            plt.savefig(save_path / f"return_steps_cluster_{cluster_id}.png")
-            plt.close()
-
-            avg_step = np.mean(steps)
-            return_rate = len(unique_return_users[cluster_id]) / total_visits[cluster_id]
-            stats.append((cluster_id, avg_step, return_rate))
-
+        avg_step = np.mean(steps)
+        return_rate = len(unique_return_users[cluster_id]) / total_visits[cluster_id]
+        stats.append((cluster_id, avg_step, return_rate))
     if stats:
         stat_df = pd.DataFrame(stats, columns=["Cluster", "AvgReturnStep", "ReturnRate"])
         stat_df.to_csv(save_path / "return_stats.csv", index=False)
         print("[INFO] 平均戻りステップ数と回帰率を保存しました。")
 
-    print("[INFO] クラスタ間遷移と戻りステップの分析が完了しました。")
 
-
-def plot_rating_over_exposures(
-    data_df, item_cluster_labels, save_dir, min_cluster_samples: int = 50
+def plot_bla_by_cluster_and_year(
+    data_df: pd.DataFrame,
+    item_cluster_labels: dict,
+    save_dir: str,
+    min_cluster_samples: int = 50,
+    min_sample_per_point: int = 10,
+    decay: float = 0.5,
 ):
-    """
-    MEE 検証用プロット生成関数
-    1) rating をユーザ z-score 正規化
-    2) 全クラスタ統合の MEE 曲線を描画
-    3) sample 数が min_cluster_samples 未満のクラスタを除外し
-       各クラスタ別 MEE 曲線を補助的に描画
-    """
+    # --- (0) 公開年フィルタ ---
+    def extract_year(title: str):
+        m = re.search(r"\((\d{4})\)$", title)
+        return int(m.group(1)) if m else None
 
-    base_path = Path(save_dir) / "plt" / "mee_plot"
-    base_path.mkdir(parents=True, exist_ok=True)
-    cluster_path = base_path / "by_cluster"
-    cluster_path.mkdir(parents=True, exist_ok=True)
+    df = data_df.copy()
+    df["release_year"] = df["title"].apply(extract_year)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    df["year"] = df["timestamp"].dt.year
+    df = df.dropna(subset=["release_year"])
+    df = df[df["release_year"].astype(int) == df["year"]]
 
-    # --- ① rating のユーザ基準化（z-score） ------------------------------
-    data_df = data_df.copy()
-    user_stats = data_df.groupby("userId")["rating"].agg(["mean", "std"]).reset_index()
-    user_stats["std"].replace(0, 1e-6, inplace=True)  # 分散ゼロ対策
-    data_df = data_df.merge(user_stats, on="userId", how="left")
-    data_df["rating_z"] = (data_df["rating"] - data_df["mean"]) / data_df["std"]
+    # --- (1) クラスタ & Exposure 計算 ---
+    df["cluster"] = df["title"].map(item_cluster_labels)
+    df = df.dropna(subset=["cluster"])
+    df = df.sort_values(["userId", "cluster", "timestamp"])
+    df["cluster_exposure"] = df.groupby(["userId", "cluster"]).cumcount() + 1
 
-    # --- ② クラスタ情報付与と exposure 計算 ------------------------------
-    data_df["cluster"] = data_df["title"].map(item_cluster_labels)
-    data_df.dropna(subset=["cluster"], inplace=True)
-    data_df = data_df.sort_values(["userId", "timestamp"])
-    data_df["cluster_exposure"] = data_df.groupby(["userId", "cluster"]).cumcount() + 1
+    # --- (2) total_reps 計算 & フィルタ ---
+    reps = df.groupby(["userId", "cluster"]).size().reset_index(name="total_reps")
+    df = df.merge(reps, on=["userId", "cluster"])
+    df = df[(df["total_reps"] >= 5) & (df["total_reps"] <= 30)]
 
-    # pair 単位の総 exposure
-    repetition_counts = data_df.groupby(["userId", "cluster"]).size().reset_index(name="total_reps")
-    data_df = data_df.merge(repetition_counts, on=["userId", "cluster"])
+    # --- (3) 小規模クラスタ除外 ---
+    valid_clusters = df["cluster"].value_counts()[lambda s: s > 10].index
+    df = df[df["cluster"].isin(valid_clusters)]
 
-    # 5〜50回にトリミング
-    data_df = data_df[(data_df["total_reps"] >= 5) & (data_df["total_reps"] <= 50)]
+    # --- (4) BLA 計算（日単位）---
+    def compute_bla_series(times: pd.Series):
+        out = []
+        with np.errstate(divide="ignore", invalid="ignore"):
+            for i, t in enumerate(times):
+                if i == 0:
+                    out.append(0.0)
+                else:
+                    past = times.iloc[:i]
+                    diffs = (t - past).dt.total_seconds() / 86400.0
+                    out.append(np.log((diffs ** (-decay)).sum()))
+        return pd.Series(out, index=times.index)
 
-    # rep クラス付与
-    def categorize(rep):
-        return (
-            "LowRep"
-            if rep <= 16
-            else "ModRep" if rep <= 27 else "HighRep" if rep <= 38 else "VHRep"
-        )
-
-    data_df["rep_class"] = data_df["total_reps"].apply(categorize)
-
-    # ===== ③ 統合プロット =================================================
-    plot_df_all = (
-        data_df.groupby(["rep_class", "cluster_exposure"])["rating_z"].mean().reset_index()
+    df["bla"] = (
+        df.groupby(["userId", "cluster"])["timestamp"]
+        .apply(compute_bla_series)
+        .reset_index(level=[0, 1], drop=True)
     )
-    plt.figure(figsize=(10, 6))
-    for cls in ["LowRep", "ModRep", "HighRep", "VHRep"]:
-        cls_df = plot_df_all[plot_df_all["rep_class"] == cls]
-        plt.plot(cls_df["cluster_exposure"], cls_df["rating_z"], label=cls, marker="o")
-    plt.title("Average *Z-scored* Rating over Cluster Exposure (All Clusters)")
-    plt.xlabel("Exposure Count to Same Cluster")
-    plt.ylabel("Average Z-scored Rating")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(base_path / "cluster_based_mee_plot.png")
-    plt.close()
 
-    # ===== ④ クラスタ別プロット ==========================================
-    cluster_counts = data_df["cluster"].value_counts()
-    valid_clusters = cluster_counts[cluster_counts >= min_cluster_samples].index
-    plot_df_by_cluster = (
-        data_df[data_df["cluster"].isin(valid_clusters)]
-        .groupby(["cluster", "rep_class", "cluster_exposure"])["rating_z"]
-        .mean()
+    # --- (5) inf/NaN を完全に除去 ---
+    df = df[np.isfinite(df["bla"])]
+
+    # --- (6) rep_class (累積ユーザー数4分割) ---
+    pairs = (
+        df[["userId", "cluster", "total_reps"]]
+        .drop_duplicates(subset=["userId", "cluster"])
+        .sort_values("total_reps")
+    )
+    total_users = pairs["userId"].nunique()
+    uc = (
+        pairs.groupby("total_reps")["userId"]
+        .nunique()
+        .reset_index(name="n_users")
+        .sort_values("total_reps")
+    )
+    uc["cum"] = uc["n_users"].cumsum()
+    q25, q50, q75 = total_users * 0.25, total_users * 0.50, total_users * 0.75
+    t1 = int(uc.loc[uc["cum"] >= q25, "total_reps"].iloc[0])
+    t2 = int(uc.loc[uc["cum"] >= q50, "total_reps"].iloc[0])
+    t3 = int(uc.loc[uc["cum"] >= q75, "total_reps"].iloc[0])
+
+    bins = [0, t1 + 1, t2 + 1, t3 + 1, pairs["total_reps"].max() + 1]
+    labels = ["LowRep", "ModRep", "HighRep", "VHRep"]
+    df["rep_class"] = pd.cut(df["total_reps"], bins=bins, labels=labels, right=False)
+
+    print("\n[INFO] Repetition-class summary:")
+    print(
+        df.groupby("rep_class")
+        .agg(num_users=("userId", "nunique"), num_clusters=("cluster", "nunique"))
+        .reset_index()
+        .to_string(index=False)
+    )
+
+    # --- 出力パス準備 ---
+    base = Path(save_dir) / "plt" / "mee_plot"
+    by_cluster_dir = base / "by_cluster"
+    by_year_dir = base / "by_year"
+    by_cluster_dir.mkdir(parents=True, exist_ok=True)
+    by_year_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- (7) クラスタ別プロット ---
+    cl_agg = (
+        df.groupby(["cluster", "rep_class", "cluster_exposure"])
+        .agg(
+            mean_bla=("bla", "mean"),
+            count=("bla", "count"),
+            sem_bla=("bla", lambda x: sem(x) if x.count() > 1 else np.nan),
+        )
         .reset_index()
     )
-    for cluster_id in sorted(valid_clusters):
-        cdf = plot_df_by_cluster[plot_df_by_cluster["cluster"] == cluster_id]
-        plt.figure(figsize=(10, 6))
-        for cls in ["LowRep", "ModRep", "HighRep", "VHRep"]:
-            tmp = cdf[cdf["rep_class"] == cls]
-            if not tmp.empty:
-                plt.plot(tmp["cluster_exposure"], tmp["rating_z"], label=cls, marker="o")
-        plt.title(f"Cluster {cluster_id}: Z-scored Rating over Exposure (n≥{min_cluster_samples})")
-        plt.xlabel("Exposure Count to Same Cluster")
-        plt.ylabel("Average Z-scored Rating")
+    # プロット前にサンプル数不足を除外
+    cl_agg = cl_agg[cl_agg["count"] >= min_sample_per_point]
+
+    for cid in sorted(valid_clusters):
+        sub = cl_agg[cl_agg["cluster"] == cid]
+        if sub.empty:
+            continue
+        plt.figure(figsize=(8, 5))
+        for cls in labels:
+            tmp = sub[sub["rep_class"] == cls]
+            if tmp.empty:
+                continue
+            x, y = tmp["cluster_exposure"], tmp["mean_bla"]
+            e = 1.96 * tmp["sem_bla"]
+            plt.plot(x, y, marker="o", label=cls)
+            plt.fill_between(x, y - e, y + e, alpha=0.3)
+        plt.title(f"Cluster {cid}: BLA vs Exposure (days)")
+        plt.xlabel("Exposure Count")
+        plt.ylabel("BLA")
         plt.legend()
         plt.grid(True)
         plt.tight_layout()
-        plt.savefig(cluster_path / f"cluster_{cluster_id}_mee_plot.png")
+        plt.savefig(by_cluster_dir / f"cluster_{cid}_bla.png")
         plt.close()
 
-    print(
-        f"[INFO] MEE プロット（ユーザz-score & n≥{min_cluster_samples}クラスタ）保存先: {base_path}"
+    # --- (8) 年代別サブプロット ---
+    yr_agg = (
+        df.groupby(["year", "rep_class", "cluster_exposure"])
+        .agg(
+            mean_bla=("bla", "mean"),
+            count=("bla", "count"),
+            sem_bla=("bla", lambda x: sem(x) if x.count() > 1 else np.nan),
+        )
+        .reset_index()
     )
+    yr_agg = yr_agg[yr_agg["count"] >= min_sample_per_point]
+
+    years = sorted(yr_agg["year"].unique())
+    ncols, nrows = 2, (len(years) + 1) // 2
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4), sharex=True, sharey=True)
+    axes = axes.flatten()
+
+    for i, yr in enumerate(years):
+        ax = axes[i]
+        sub = yr_agg[yr_agg["year"] == yr]
+        for cls in labels:
+            tmp = sub[sub["rep_class"] == cls]
+            if tmp.empty:
+                continue
+            x, y = tmp["cluster_exposure"], tmp["mean_bla"]
+            e = 1.96 * tmp["sem_bla"]
+            ax.plot(x, y, label=cls)
+            ax.fill_between(x, y - e, y + e, alpha=0.2)
+        ax.set_title(f"Year {yr}")
+        ax.set_xlim(0, 30)
+        ax.grid(True)
+        if i == 0:
+            ax.legend()
+
+    for j in range(len(years), len(axes)):
+        fig.delaxes(axes[j])
+
+    fig.supxlabel("Exposure Count")
+    fig.supylabel("BLA")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.savefig(by_year_dir / "bla_by_year.png")
+    plt.close()
+
+    print("[INFO] Cluster- and Year-based BLA plots saved.")
+
+
+def plot_rating_by_year_subplots(
+    data_df: pd.DataFrame,
+    item_cluster_labels: dict,
+    save_dir: str,
+    min_cluster_samples: int = 50,
+    min_sample_per_point: int = 10,
+):
+    """
+    クラスタ別・反復レベル別に MEE (逆 U 字) を可視化し、
+    repetition-class を「(userId, cluster) ごとの累積ユーザー数」
+    がほぼ均等になるように４分割して付与。
+    * items ≤ 10 本しかないクラスタは除外
+    * 作品タイトル末尾の (YYYY) から公開年を抜き出し、
+      視聴年と一致する作品のみ対象
+    """
+
+    # --- 0. release_year をタイトルから抽出 ---
+    def extract_year(title: str):
+        m = re.search(r"\((\d{4})\)$", title)
+        return int(m.group(1)) if m else None
+
+    df = data_df.copy()
+    df["release_year"] = df["title"].apply(extract_year)
+    df = df.dropna(subset=["release_year"])
+    df["release_year"] = df["release_year"].astype(int)
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    df["year"] = df["timestamp"].dt.year
+
+    # --- 1. rating をユーザ基準化 (z-score) ---
+    # grand_mean = df["rating"].mean()
+    user_means = df.groupby("userId")["rating"].mean().rename("user_mean")
+    # item_means = df.groupby("title")["rating"].mean().rename("item_mean")
+    df = df.merge(user_means, on="userId", how="left")
+    # df = df.merge(item_means, on="title", how="left")
+    df["rating_z"] = df["rating"] - df["user_mean"]  # - df["item_mean"] + grand_mean
+    # --- 3. クラスタ付与 & Exposure 計算 ---
+    df["cluster"] = df["title"].map(item_cluster_labels)
+    df = df.dropna(subset=["cluster"])
+    df["rating_z"] = df.groupby("cluster")["rating_z"].transform(
+        lambda vals: rft_ratings(vals.tolist(), w=0.5)
+    )
+    df = df.sort_values(["userId", "timestamp"])
+    df["cluster_exposure"] = df.groupby(["userId", "cluster"]).cumcount() + 1
+
+    reps = df.groupby(["userId", "cluster"]).size().reset_index(name="total_reps")
+    df = df.merge(reps, on=["userId", "cluster"])
+    df = df[(df["total_reps"] >= 5) & (df["total_reps"] <= 50)]
+
+    # --- 4. 小規模クラスタ(≤10)を除外 ---
+    valid_clusters = df["cluster"].value_counts()[lambda s: s > 10].index
+    df = df[df["cluster"].isin(valid_clusters)]
+
+    # --- 5. (userId,cluster) ごとに 1 行にまとめて累積ユーザー数を計算 ---
+
+    # --- 6. repetition-class 付与 ---
+    bins = [0, 10, 20, 30, 50]
+    labels = ["LowRep", "ModRep", "HighRep", "VHRep"]
+    df["rep_class"] = pd.cut(df["total_reps"], bins=bins, labels=labels, right=False)
+
+    print("\n[INFO] Counts per repetition-class:")
+    for cls in labels:
+        sub = df[df["rep_class"] == cls]
+        title_count = sub["title"].nunique()
+        cluster_count = sub["cluster"].nunique()
+        print(f"  {cls}: titles = {title_count}, clusters = {cluster_count}")
+
+    # --- 7. 全クラスタ統合プロット (rep_class別) ---
+    agg = (
+        df.groupby(["rep_class", "cluster_exposure"])["rating_z"]
+        .agg(mean="mean", sem=sem, count="count")
+        .reset_index()
+    )
+    rep_class_styles = {
+        "LowRep": ("blue", "o"),
+        "ModRep": ("orange", "s"),
+        "HighRep": ("green", "X"),
+        "VHRep": ("red", "D"),
+    }
+
+    plt.figure(figsize=(10, 6))
+    for cls in labels:
+        tmp = agg[agg["rep_class"] == cls]
+        if tmp.empty:
+            continue
+        x = tmp["cluster_exposure"]
+        y = tmp["mean"]
+        e = 1.96 * tmp["sem"]
+        color, marker = rep_class_styles[cls]
+        plt.errorbar(
+            x,
+            y,
+            yerr=e,
+            fmt=f"-{marker}",
+            color=color,
+            capsize=1,
+            elinewidth=0.5,
+            markeredgewidth=1,
+            label=cls,
+        )
+
+    plt.title("Average Z-scored Rating vs Cluster Exposure (All Repetition Classes)")
+    plt.xlim(0, 30)
+    plt.xlabel("Exposure Count to Same Cluster")
+    plt.ylabel("Average Z-scored Rating")
+    plt.grid(True)
+    plt.legend()
+    base_path = Path(save_dir) / "plt" / "mee_plot"
+    base_path.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(base_path / "all_rep_classes_mee_plot.png")
+    plt.close()
+
+    # --- 8. repetition-class ごとの 2 次回帰結果表示 (x ≤ 30) ---
+    print("\n[INFO] Quadratic fit per repetition-class (x ≤ 30)")
+    for cls in labels:
+        df_sub = df[(df["rep_class"] == cls) & (df["cluster_exposure"] <= 30)]
+        if df_sub.empty:
+            continue
+        tmp = df_sub.groupby("cluster_exposure")["rating_z"].mean().reset_index()
+        x, y = tmp["cluster_exposure"].values, tmp["rating_z"].values
+        X = np.column_stack([np.ones_like(x), x, x**2])
+        model = sm.OLS(y, X).fit()
+        print(
+            f"  {cls:7s}: R²={model.rsquared:.3f} , β₂={model.params[2]:+.4f} (p={model.pvalues[2]:.3g})"
+        )
+
+        # --- 8. ブートストラップ検証関数 ---
+
+    def bootstrap_beta2_for_class(df_sub, B=1000, seed=42):
+        rng = np.random.RandomState(seed)
+        beta2_vals = []
+        for _ in range(B):
+            boot_df = resample(df_sub, replace=True, n_samples=len(df_sub), random_state=rng)
+            x_b, y_b = boot_df["cluster_exposure"].values, boot_df["rating_z"].values
+            X_b = np.column_stack([np.ones_like(x_b), x_b, x_b**2])
+            m = sm.OLS(y_b, X_b).fit()
+            beta2_vals.append(m.params[2])
+        arr = np.array(beta2_vals)
+        ci_low, ci_up = np.percentile(arr, [2.5, 97.5])
+        p_boot = 2 * np.mean(arr > 0)
+        return ci_low, ci_up, p_boot
+
+    # --- 9. ブートストラップによる β₂ の頑健性検証 ---
+    print("\n[INFO] Bootstrap validation of β₂ for each repetition class")
+    for cls in labels:
+        df_sub = df[(df["rep_class"] == cls) & (df["cluster_exposure"] <= 30)]
+        if len(df_sub) < min_sample_per_point:
+            continue
+        ci_low, ci_up, p_boot = bootstrap_beta2_for_class(df_sub, B=1000)
+        print(f"  {cls:7s}: β₂ 95% CI [{ci_low:.5f}, {ci_up:.5f}], bootstrap p≈{p_boot:.3f}")
+    # --- 9. クラスタ別プロット (errorbarで信頼区間を表示) ---
+    cl_agg = (
+        df.groupby(["cluster", "rep_class", "cluster_exposure"])["rating_z"]
+        .agg(mean="mean", sem=sem, count="count")
+        .reset_index()
+    )
+    cluster_dir = base_path / "by_cluster"
+    cluster_dir.mkdir(parents=True, exist_ok=True)
+
+    for cid in sorted(valid_clusters):
+        sub = cl_agg[cl_agg["cluster"] == cid]
+        if sub.empty:
+            continue
+        plt.figure(figsize=(10, 6))
+        for cls in labels:
+            tmp = sub[(sub["rep_class"] == cls) & (sub["count"] >= min_sample_per_point)]
+            if tmp.empty:
+                continue
+            x = tmp["cluster_exposure"]
+            y = tmp["mean"]
+            e = 1.96 * tmp["sem"]
+            color, marker = rep_class_styles[cls]
+            plt.errorbar(
+                x,
+                y,
+                yerr=e,
+                fmt=f"-{marker}",
+                color=color,
+                capsize=3,
+                elinewidth=1,
+                markeredgewidth=1,
+                label=cls,
+            )
+        plt.title(f"Cluster {cid}: Z-scored Rating vs Exposure (n≥{min_cluster_samples})")
+        plt.xlabel("Exposure Count to Same Cluster")
+        plt.ylabel("Average Z-scored Rating")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(cluster_dir / f"cluster_{cid}_mee_plot.png")
+        plt.close()
+
+    # --- 10. クラスタ固定効果付き2次回帰 ---
+    print("\n[INFO] クラスタ固定効果付き2次回帰（x ≤ 30）")
+    df_sub = df[df["cluster_exposure"] <= 30].copy()
+    if df_sub.empty:
+        print("データがありません。")
+    else:
+        df_sub["exposure_sq"] = df_sub["cluster_exposure"] ** 2
+        formula = "rating_z ~ cluster_exposure + exposure_sq + C(cluster)"
+        model = sm.OLS.from_formula(formula, data=df_sub).fit()
+        print(model.summary())
+        print(
+            "\n[INFO] exposure_sq の係数: {:.4f}, p-value: {:.4g}".format(
+                model.params["exposure_sq"], model.pvalues["exposure_sq"]
+            )
+        )
+
+    return df
+
+
+def rft_ratings(values, w=0.5):
+    """
+    Parducci の RFT（範囲–周波数理論）を NumPy で高速実装。
+    values: list[float] 文脈中の評価値リスト
+    w: 範囲原理の重み (0≤w≤1)
+    """
+    arr = np.asarray(values, dtype=float)  # リスト→NumPy 配列化
+    mn, mx = (
+        arr.min(),
+        arr.max(),
+    )  # 最小・最大の取得は O(n)
+    # 範囲原理：配列化された演算で一括正規化
+    if mx > mn:
+        R = (arr - mn) / (mx - mn)
+    else:
+        R = np.full_like(arr, 0.5)
+
+    # 頻度原理：np.sort＋searchsorted で O(n log n) → O(n) 近似に
+    sorted_vals = np.sort(
+        arr
+    )  # 内部では速いソート実装  [oai_citation:1‡llego.dev](https://llego.dev/posts/numpy-sorting-arrays/?utm_source=chatgpt.com)
+    # each element’s rank = 挿入位置 / (N-1)
+    N = arr.size
+    if N > 1:
+        F = np.searchsorted(sorted_vals, arr, side="right") / (
+            N - 1
+        )  # O(n log n)  [oai_citation:2‡NumPy](https://numpy.org/doc/2.2/reference/generated/numpy.searchsorted.html?utm_source=chatgpt.com)
+    else:
+        F = np.full_like(arr, 0.5)
+
+    # 加重平均もベクトルで一括
+    J = w * R + (1 - w) * F
+    return J.tolist()
+
+
+def detect_non_invU_users(df: pd.DataFrame, x_range=(30, 60), min_exposures: int = 30):
+    """
+    各ユーザー・クラスタごとに二次回帰をあてはめ、
+    二次項係数が正（convex: 上に凸）になっているペアを抽出する。
+
+    Parameters:
+      df: DataFrame
+        必須列: ['userId', 'title', 'cluster_exposure', 'rating_z', 'cluster']
+      min_exposures, max_exposures: int
+        exposure 回数の範囲フィルタ（データ点の数）
+      x_range: tuple
+        x（cluster_exposure）の範囲フィルタ（例: (30, 50)）
+    Returns:
+      List[(userId, clusterId)]
+    """
+
+    convex_pairs = []
+    x_min, x_max = x_range
+    for (user, cluster), grp in df.groupby(["userId", "cluster"]):
+        # xを範囲指定でフィルタ
+        mask = (grp["cluster_exposure"] >= x_min) & (grp["cluster_exposure"] <= x_max)
+        sub_grp = grp.loc[mask]
+
+        x = sub_grp["cluster_exposure"].values
+        y = sub_grp["rating_z"].values
+
+        # exposure 回数の範囲チェック
+        if min_exposures <= len(x):
+            # 2次多項式フィット
+            coefs = np.polyfit(x, y, 2)
+            # 二次項が正ならconvex（上に凸）
+            if coefs[0] > 0:
+                convex_pairs.append((user, cluster))
+        else:
+            print("No User not inversed shaped over 30 expousres")
+    return convex_pairs
+
+
+def build_cluster_transition_network_for_group(
+    data_df,
+    item_cluster_labels: dict,
+    save_dir: Path,
+    min_count: int = 1,
+    prob_threshold: float = 0.01,
+    highlight_top_k: int = 50,
+):
+    """
+    ユーザー群のクラスタ間遷移ネットワークを“確率”ベースで可視化します。
+    ・min_count       : 遷移回数がこの値以上のエッジのみ対象
+    ・prob_threshold  : 確率がこの値以上のエッジのみ描画
+    ・highlight_top_k : 確率上位 K 本のエッジを太く／濃く強調
+    """
+
+    # 1) 遷移カウント集計
+    transition_counts = defaultdict(int)
+    for _, grp in data_df.groupby("userId"):
+        seq = [
+            item_cluster_labels.get(t)
+            for t in grp.sort_values("timestamp")["title"]
+            if t in item_cluster_labels
+        ]
+        for src, dst in zip(seq, seq[1:]):
+            if src is not None and dst is not None and src != dst:
+                transition_counts[(src, dst)] += 1
+
+    # 2) グラフ構築＋min_count フィルタ
+    G = nx.DiGraph()
+    for (src, dst), cnt in transition_counts.items():
+        if cnt >= min_count:
+            G.add_edge(src, dst, count=cnt)
+    if G.number_of_edges() == 0:
+        print("遷移データがありません。閾値を緩めてください。")
+        return
+
+    # 3) 各ノードからの出力合計を計算し、prob 属性を追加
+    out_sum = {u: sum(d["count"] for _, _, d in G.out_edges(u, data=True)) for u in G.nodes()}
+    for u, v, d in G.edges(data=True):
+        total = out_sum.get(u, 0)
+        d["prob"] = (d["count"] / total) if total > 0 else 0.0
+
+    # 4) レイアウト
+    pos = nx.kamada_kawai_layout(G, weight=None)
+
+    # 5) エッジ情報収集＆上位 K 強調セット
+    edges = list(G.edges(data=True))
+    sorted_edges = sorted(edges, key=lambda x: x[2]["prob"], reverse=True)
+    top_edges = {(u, v) for u, v, _ in sorted_edges[:highlight_top_k]}
+
+    # 6) カラーマッピング（クラスタ数分の落ち着いた色）
+    unique_cids = sorted(G.nodes())
+    n = len(unique_cids)
+    pal = sns.color_palette("husl", n)
+    cluster_to_color = {cid: pal[i] for i, cid in enumerate(unique_cids)}
+
+    # 7) ノードサイズ（出力中心性）
+    outdeg = nx.in_degree_centrality(G)
+    node_sizes = [100 + 3000 * outdeg.get(cid, 0) for cid in unique_cids]
+
+    # 8) 描画
+    plt.figure(figsize=(10, 10))
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        nodelist=unique_cids,
+        node_size=node_sizes,
+        node_color=[cluster_to_color[cid] for cid in unique_cids],
+        edgecolors="white",
+        alpha=0.9,
+    )
+    for u, v, d in edges:
+        p = d["prob"]
+        if p < prob_threshold:
+            continue
+        if (u, v) in top_edges:
+            width, alpha = 1.0 + 4.0 * p, min(p * 1.5, 1)
+        else:
+            width, alpha = 1.0 + 2.0 * p, p
+        arrow_size = 10 + 10 * p
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            edgelist=[(u, v)],
+            width=width,
+            edge_color="gray",
+            alpha=alpha,
+            arrowstyle="<->",
+            arrows=True,
+            arrowsize=arrow_size,
+        )
+
+    plt.title(f"Cluster Transition Network (n_users={data_df['userId'].nunique()})")
+    plt.axis("off")
+
+    # 9) 昇順ソートした凡例
+    legend_handles = [
+        Patch(facecolor=cluster_to_color[cid], edgecolor="black", label=f"Cluster {cid}")
+        for cid in unique_cids
+    ]
+    plt.legend(
+        handles=legend_handles,
+        title="Cluster",
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        fontsize=8,
+        title_fontsize=9,
+        frameon=True,
+    )
+    plt.subplots_adjust(right=0.75)
+
+    # 10) 保存
+    out_dir = save_dir / "plt" / "network" / "cluster_group"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "cluster_group_transition_network.png"
+    plt.savefig(out_path, bbox_inches="tight", dpi=150)
+    plt.close()
+    print(f"[INFO] ネットワークを保存しました: {out_path}")
 
 
 def main():
