@@ -120,7 +120,13 @@ def main(args_dict: Dict[str, Any]):
         meta_df = dataloader.data_gen[["movieId", "title", "genres"]].drop_duplicates()
         meta_df["main_genre"] = meta_df["genres"].apply(lambda g: g.split("|")[0])
         _, _, labels = evaluate_clustering_with_genre_sets(
-            vec_df, meta_df, "title", "genres", BASE_DIR
+            vec_df=vec_df,
+            meta_df=meta_df,
+            id_col="title",
+            genre_col="genres",
+            save_dir=BASE_DIR,
+            k_range=range(2, 40),
+            method="kmeans",
         )
         item_cluster_labels = dict(zip(vec_df.index, labels))
     else:
@@ -131,7 +137,14 @@ def main(args_dict: Dict[str, Any]):
 
     print_cluster_counts_and_ratios(item_cluster_labels)
     plot_embeddings_tsne(trainer.book_embeddings, BASE_DIR, labels, "artwork")
-    plot_with_umap(trainer.book_embeddings, labels, "artwork", BASE_DIR)
+    # UMAP 可視化 ＋ シルエットスコア取得
+    plot_with_umap(
+        embeddings=trainer.book_embeddings,
+        labels=labels,
+        label_name="artwork",
+        umap_dir=BASE_DIR,
+        scaler=True,  # シルエットスコアを返す
+    )
 
     # 低サンプルクラスタの削除
     cluster_item_counts = Counter(item_cluster_labels.values())

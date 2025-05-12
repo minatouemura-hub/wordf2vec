@@ -273,48 +273,75 @@ def evaluate_clustering_with_genre_sets(
     save_dir: Path = Path("."),
     k_range: range = range(15, 51),
     random_state: int = 42,
+    method: str = "kmeans",
+    linkage_method: str = "ward",
 ) -> Tuple[pd.DataFrame, float, np.ndarray]:
-    from sklearn.cluster import KMeans
+    """
+    マルチジャンルによるクラスタ評価。
+    method: "kmeans" or "hierarchical"
+    linkage_method: 階層クラスタリング時のリンク法
+    """
+    from scipy.cluster.hierarchy import linkage
+    from sklearn.cluster import AgglomerativeClustering, KMeans
+    from sklearn.metrics import label_ranking_average_precision_score
+    from sklearn.preprocessing import MultiLabelBinarizer
 
-    print("\n▶️ マルチジャンルによるクラスタ評価を実行中...")
+    print(f"\n▶️ マルチジャンルによるクラスタ評価を実行中... method={method}")
 
     X = vec_df.values
-    inertia_list = []
 
-    for k in k_range:
-        kmeans = KMeans(n_clusters=k, random_state=random_state)
-        kmeans.fit(X)
-        inertia_list.append(kmeans.inertia_)
-
-    kl = KneeLocator(list(k_range), inertia_list, curve="convex", direction="decreasing")
-    optimal_k = kl.knee if kl.knee is not None else k_range.start
+    # クラスタ数推定
+    if method == "kmeans":
+        inertia_list = []
+        for k in k_range:
+            km = KMeans(n_clusters=k, random_state=random_state).fit(X)
+            inertia_list.append(km.inertia_)
+        kl = KneeLocator(list(k_range), inertia_list, curve="convex", direction="decreasing")
+        optimal_k = kl.knee if kl.knee is not None else k_range.start
+    else:
+        # 階層クラスタのリンケージ距離ギャップ法
+        Z = linkage(X, method=linkage_method)
+        dists = Z[:, 2]
+        gaps = np.diff(dists)
+        idx = np.argmax(gaps)
+        optimal_k = X.shape[0] - (idx + 1)
+        min_k, max_k = k_range.start, k_range.stop - 1
+        optimal_k = max(min_k, optimal_k)
+        optimal_k = min(max_k, optimal_k)
     print(f"推定された最適クラスタ数: {optimal_k}")
 
-    kmeans = KMeans(n_clusters=optimal_k, random_state=random_state)
-    cluster_labels = kmeans.fit_predict(X)
+    # クラスタリング実行
+    if method == "kmeans":
+        cluster_labels = KMeans(n_clusters=optimal_k, random_state=random_state).fit_predict(X)
+    else:
+        cluster_labels = AgglomerativeClustering(
+            n_clusters=optimal_k, linkage=linkage_method
+        ).fit_predict(X)
 
+    # メタデータ統合
     df = vec_df.reset_index().copy()
     df["cluster"] = cluster_labels
-    df = df.merge(meta_df[[id_col, genre_col]], on=id_col)
-    df["genre_list"] = df[genre_col].apply(lambda x: x.split("|") if pd.notnull(x) else [])
 
+    meta_unique = meta_df[[id_col, genre_col]].drop_duplicates(subset=id_col, keep="first")
+    df = df.merge(meta_unique, on=id_col, how="left", validate="1:1")
+
+    df["genre_list"] = df[genre_col].fillna("").apply(lambda x: x.split("|") if x else [])
+    # ジャンルのワンホット
     mlb = MultiLabelBinarizer()
     Y = mlb.fit_transform(df["genre_list"])
     genres = mlb.classes_
 
+    # クラスタごとのジャンル分布
     cluster_genre_dist = pd.DataFrame(0, index=range(optimal_k), columns=genres)
     for cl in range(optimal_k):
-        labels_list = df[df["cluster"] == cl]["genre_list"]
-        counts = pd.Series([g for sub in labels_list for g in sub]).value_counts()
-        for g in counts.index:
-            cluster_genre_dist.loc[cl, g] = counts[g]
+        lists = df[df["cluster"] == cl]["genre_list"]
+        counts = pd.Series([g for sub in lists for g in sub]).value_counts()
+        cluster_genre_dist.loc[cl, counts.index] = counts.values
 
-    cluster_genre_dist_norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
-
+    # 正規化＆Zスコアヒートマップ
+    norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
+    zscore_df = (norm - norm.mean()) / norm.std()
     plt.figure(figsize=(14, 6))
-    zscore_df = (
-        cluster_genre_dist_norm - cluster_genre_dist_norm.mean()
-    ) / cluster_genre_dist_norm.std()
     sns.heatmap(zscore_df, annot=True, fmt=".2f", cmap="RdBu_r", center=0)
     plt.title("Cluster-wise Multi-Genre Distribution (z-score)")
     plt.ylabel("Cluster")
@@ -323,14 +350,10 @@ def evaluate_clustering_with_genre_sets(
     plt.savefig(save_dir / "plt" / "cluster_genre_zscore.png")
     plt.close()
 
-    genre_scores = df["cluster"].map(cluster_genre_dist_norm.to_dict(orient="index"))
-    genre_score_matrix = (
-        pd.DataFrame(list(genre_scores), index=df.index)[mlb.classes_].fillna(0).values
-    )
-
-    lrap = label_ranking_average_precision_score(Y, genre_score_matrix)
-    adj_lrap = adjusted_lrap(lrap, optimal_k, 30, 1.0)
-
+    # LRAP 計算
+    score_matrix = pd.DataFrame([norm.loc[c] for c in cluster_labels], index=df.index).values
+    lrap = label_ranking_average_precision_score(Y, score_matrix)
+    adj_lrap = adjusted_lrap(lrap, optimal_k, len(genres), 1.0)
     print(f"✅ LRAP: {lrap:.4f}  / Adjusted LRAP: {adj_lrap:.4f}")
 
     return cluster_genre_dist, lrap, cluster_labels
@@ -344,7 +367,6 @@ def evaluate_fast_greedy_with_genre_sets(item_cluster_labels, meta_df, save_dir:
     )
     df = df.merge(meta_df[["title", "genres"]], on="title", how="left")
     df["genre_list"] = df["genres"].apply(lambda x: x.split("|") if pd.notnull(x) else [])
-
     mlb = MultiLabelBinarizer()
     Y = mlb.fit_transform(df["genre_list"])
     genres = mlb.classes_
@@ -359,10 +381,6 @@ def evaluate_fast_greedy_with_genre_sets(item_cluster_labels, meta_df, save_dir:
             cluster_genre_dist.loc[cl, g] = counts[g]
 
     cluster_genre_dist_norm = cluster_genre_dist.div(cluster_genre_dist.sum(axis=1), axis=0)
-
-    # ヒートマップの描画と保存
-    import matplotlib.pyplot as plt
-    import seaborn as sns
 
     zscore_df = (
         cluster_genre_dist_norm - cluster_genre_dist_norm.mean()

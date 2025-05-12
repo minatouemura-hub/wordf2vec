@@ -14,7 +14,9 @@ import statsmodels.api as sm
 from matplotlib import colormaps
 from matplotlib.patches import Patch
 from scipy.stats import sem
+from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
+from sklearn.metrics import davies_bouldin_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils import resample
 from tqdm import tqdm
@@ -184,7 +186,15 @@ def plot_embeddings_tsne(embeddings, save_dir: Path, labels=None, label_name="em
     embeddings = StandardScaler().fit_transform(embeddings)
 
     # t-SNE 設定（初期化方法・繰り返し回数・perplexity を明示）
-    tsne = TSNE(n_components=2, perplexity=50, random_state=42, init="pca", n_iter=500)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=10,  # ← まずは 30,  then 10→50 と試す
+        learning_rate=500,  # ← 中間値から
+        early_exaggeration=20.0,  # ← デフォルト 12→20 で広がり確認
+        init="pca",
+        n_iter=1000,
+        random_state=42,
+    )
     emb_2d = tsne.fit_transform(embeddings)
 
     # プロット
@@ -206,24 +216,80 @@ def plot_embeddings_tsne(embeddings, save_dir: Path, labels=None, label_name="em
     print(f"[INFO] t-SNEプロットを {save_path} に保存しました")
 
 
-def plot_with_umap(embeddings, labels=None, label_name="embedding", umap_dir=None):
-    reducer = UMAP(n_components=2, random_state=42)
-    emb_2d = reducer.fit_transform(embeddings)
+def plot_with_umap(
+    embeddings,
+    labels=None,
+    label_name="embedding",
+    umap_dir=None,
+    scaler=True,
+):
+    """
+    PCA+UMAPで可視化する関数
 
+    Parameters:
+        embeddings (ndarray): shape=(n_samples, dim)
+        labels (array-like): クラスタラベルなど（色分けに使用、任意）
+        label_name (str): ファイル名及びプロットタイトルに使用
+        umap_dir (Path): 結果保存先の親ディレクトリ
+        scaler (bool): PCA前にStandardScalerするか
+        return_metrics (bool): シルエットスコアを計算して返すか
+
+    Returns:
+        silhouette (float, optional): return_metrics=Trueの場合のみ返却
+    """
+    # 前処理: スケーリング
+    X = embeddings.copy()
+    if scaler:
+        X = StandardScaler().fit_transform(X)
+
+    # グリッドサーチパラメータ
+    n_neighbors_list = [15, 30, 50]
+    min_dist_list = [0.001, 0.01, 0.05]
+
+    best_params = None
+    best_score = -1.0
+    best_emb_2d = None
+
+    # グリッド探索
+    for n_neighbors in n_neighbors_list:
+        for min_dist in min_dist_list:
+            reducer = UMAP(
+                n_components=2,
+                n_neighbors=n_neighbors,
+                min_dist=min_dist,
+                metric="cosine",
+                spread=1.5,
+                random_state=42,
+            )
+            emb_2d = reducer.fit_transform(X)
+            if labels is not None:
+                score = silhouette_score(emb_2d, labels, metric="euclidean")
+                if score > best_score:
+                    best_score = score
+                    best_params = (n_neighbors, min_dist)
+                    best_emb_2d = emb_2d
+
+    if labels is not None:
+        db_score = davies_bouldin_score(best_emb_2d, labels)
+    print(f"shilhouette:{best_score:.3f},dc_score:{db_score:.3f}")
+    # 最良パラメータで再プロット
+    n_nb, m_dist = best_params
     plt.figure(figsize=(8, 6))
     if labels is not None:
         labels = np.array(labels)
-        for label in np.unique(labels):
-            idx = labels == label
-            plt.scatter(emb_2d[idx, 0], emb_2d[idx, 1], s=5, alpha=0.6)
+        for lab in np.unique(labels):
+            idx = labels == lab
+            plt.scatter(best_emb_2d[idx, 0], best_emb_2d[idx, 1], s=5, alpha=0.6)
     else:
-        plt.scatter(emb_2d[:, 0], emb_2d[:, 1], s=5, alpha=0.6)
-
+        plt.scatter(best_emb_2d[:, 0], best_emb_2d[:, 1], s=5, alpha=0.6)
     plt.axis("off")
-    umap_dir = umap_dir / "plt"
-    umap_dir.mkdir(parents=True, exist_ok=True)
-    save_path = umap_dir / f"{label_name}_umap.png"
-    plt.savefig(save_path)
+    plt.title(f"UMAP ({label_name}) NN={n_nb} MD={m_dist} Sil={best_score:.3f}")
+
+    # 保存
+    path = Path(umap_dir) / "plt"
+    path.mkdir(parents=True, exist_ok=True)
+    save_path = path / f"{label_name}_umap_best.png"
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
     plt.close()
 
 
@@ -492,6 +558,8 @@ def plot_rating_by_year_subplots(
     save_dir: str,
     min_cluster_samples: int = 50,
     min_sample_per_point: int = 10,
+    masterpiece_threshold: float = 4.3,  # ★追加① 名作とみなす平均評価
+    masterpiece_min_votes: int = 50,  # ★追加② 名作判定に必要な最小票数
 ):
     """
     クラスタ別・反復レベル別に MEE (逆 U 字) を可視化し、
@@ -507,6 +575,18 @@ def plot_rating_by_year_subplots(
         m = re.search(r"\((\d{4})\)$", title)
         return int(m.group(1)) if m else None
 
+    # ---------- ★追加③ 名作ラベル付与＆除外 ----------
+    item_stats = (
+        data_df.groupby("title")["rating"].agg(mean_rating="mean", vote_cnt="count").reset_index()
+    )
+    masterpiece_titles = item_stats.loc[
+        (item_stats["vote_cnt"] >= masterpiece_min_votes)
+        & (item_stats["mean_rating"] >= masterpiece_threshold),
+        "title",
+    ]
+    print(f"[INFO] Excluding {len(masterpiece_titles)} masterpieces from analysis")
+    data_df = data_df[~data_df["title"].isin(masterpiece_titles)]
+
     df = data_df.copy()
     df["release_year"] = df["title"].apply(extract_year)
     df = df.dropna(subset=["release_year"])
@@ -514,7 +594,6 @@ def plot_rating_by_year_subplots(
 
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
     df["year"] = df["timestamp"].dt.year
-
     # --- 1. rating をユーザ基準化 (z-score) ---
     # grand_mean = df["rating"].mean()
     user_means = df.groupby("userId")["rating"].mean().rename("user_mean")
@@ -539,7 +618,7 @@ def plot_rating_by_year_subplots(
     valid_clusters = df["cluster"].value_counts()[lambda s: s > 10].index
     df = df[df["cluster"].isin(valid_clusters)]
 
-    # --- 5. (userId,cluster) ごとに 1 行にまとめて累積ユーザー数を計算 ---
+    # --------------------------------------------------
 
     # --- 6. repetition-class 付与 ---
     bins = [0, 10, 20, 30, 50]
