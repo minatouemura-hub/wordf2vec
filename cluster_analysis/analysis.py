@@ -294,7 +294,7 @@ def evaluate_clustering_with_genre_sets(
     if method == "kmeans":
         inertia_list = []
         for k in k_range:
-            km = KMeans(n_clusters=k, random_state=random_state).fit(X)
+            km = KMeans(n_clusters=k, n_init=50, init="k-means++", random_state=random_state).fit(X)
             inertia_list.append(km.inertia_)
         kl = KneeLocator(list(k_range), inertia_list, curve="convex", direction="decreasing")
         optimal_k = kl.knee if kl.knee is not None else k_range.start
@@ -312,7 +312,9 @@ def evaluate_clustering_with_genre_sets(
 
     # クラスタリング実行
     if method == "kmeans":
-        cluster_labels = KMeans(n_clusters=optimal_k, random_state=random_state).fit_predict(X)
+        cluster_labels = KMeans(
+            n_clusters=optimal_k, n_init=50, init="k-means++", random_state=random_state
+        ).fit_predict(X)
     else:
         cluster_labels = AgglomerativeClustering(
             n_clusters=optimal_k, linkage=linkage_method

@@ -31,7 +31,7 @@ class Word2VecCongig:
     sample: float = 1e-4
 
     # 1回分の学習用
-    embedding_dim: int = 150
+    embedding_dim: int = 50
     num_negatives: int = 35
     batch_size: int = 124
     epochs: int = 10
